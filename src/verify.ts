@@ -65,6 +65,8 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
   const findings: Finding[] = [];
   const add = (code: string, severity: Severity, message: string, seq?: number) =>
     findings.push({ code, severity, message, seq });
+  /** Anchors for this session; filled in once the genesis entry names it. */
+  let relevant: Anchor[] = [];
 
   for (const p of opts.problems ?? []) {
     if (p.missing) add('MISSING', 'tamper', `${p.message} — if an anchor exists for this session, the record was removed whole`);
@@ -181,7 +183,7 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
   // --- anchors ---------------------------------------------------------------
   const head = entries[entries.length - 1];
   let anchoredTo: Verdict['anchoredTo'];
-  const relevant = (opts.anchors ?? []).filter((a) => a.session === session);
+  relevant = (opts.anchors ?? []).filter((a) => a.session === session);
   for (const a of relevant.sort((x, y) => x.seq - y.seq)) {
     const at = entries[a.seq];
     if (!at || at.seq !== a.seq) {
