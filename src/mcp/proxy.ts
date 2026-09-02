@@ -1,7 +1,7 @@
 /**
  * A stdio MCP proxy that records. It sits between a host and a real MCP
- * server, forwards everything untouched, and writes every `tools/call` and
- * its response into the ledger.
+ * server, forwards everything untouched, and writes every `tools/list` and
+ * `tools/call` and their responses into the ledger.
  *
  * This process holds the recorder key. The server it wraps, and the agent
  * driving that server, must not be able to read this process's ledger
@@ -80,6 +80,11 @@ export function startProxy(command: string, args: string[], options: ProxyOption
     if (message.method === 'tools/call' && message.id !== undefined) {
       const name = String(message.params?.name ?? '');
       const callId = rec.call(name, message.params?.arguments ?? {}, { id: `rpc-${message.id}` });
+      pending.set(String(message.id), callId);
+    } else if (message.method === 'tools/list' && message.id !== undefined) {
+      // The catalogue is recorded as a call so the definitions the agent was
+      // shown sit in the same chain as the calls it made against them.
+      const callId = rec.call('tools/list', message.params ?? {}, { id: `rpc-${message.id}` });
       pending.set(String(message.id), callId);
     } else if (message.method === 'notifications/cancelled') {
       rec.note(`cancelled: ${JSON.stringify(message.params ?? {})}`);

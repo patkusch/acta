@@ -42,18 +42,21 @@ test('the MCP proxy records every tools/call and its response, and anchors on sc
   assert.deepEqual(responses.map((r) => r.id), [1, 2, 3, 4]);
   assert.deepEqual((responses[2].result as { content: { text: string }[] }).content[0].text, 'hi');
 
-  // The two calls were pipelined, so the ledger shows call, call, result,
-  // result — the order things actually happened in, not the order we'd draw.
+  // The requests were pipelined, so the ledger shows three calls then three
+  // results — the order things actually happened in, not the order we'd draw.
   const { entries } = readLedger(dir);
   assert.deepEqual(
     entries.map((e) => e.kind),
-    ['open', 'note', 'call', 'call', 'result', 'result', 'close'],
+    ['open', 'note', 'call', 'call', 'call', 'result', 'result', 'result', 'close'],
   );
-  const echo = entries[2] as Extract<Entry, { kind: 'call' }>;
-  assert.equal(echo.tool, 'echo');
-  assert.deepEqual(echo.args, { text: 'hi' });
+  const calls = entries.filter((e): e is Extract<Entry, { kind: 'call' }> => e.kind === 'call');
+  assert.deepEqual(calls.map((c) => c.tool), ['tools/list', 'echo', 'explode']);
+  assert.deepEqual(calls[1].args, { text: 'hi' });
   const results = entries.filter((e): e is Extract<Entry, { kind: 'result' }> => e.kind === 'result');
-  assert.deepEqual(results.map((r) => [r.of, r.ok]), [['rpc-3', true], ['rpc-4', false]]);
+  assert.deepEqual(results.map((r) => [r.of, r.ok]), [['rpc-2', true], ['rpc-3', true], ['rpc-4', false]]);
+  // The catalogue the agent was shown is in the chain, with the tool definitions verbatim.
+  const catalogue = results[0].body as { tools: { name: string }[] };
+  assert.deepEqual(catalogue.tools.map((t) => t.name), ['echo', 'explode']);
 
   const anchors = readAnchors(anchorTo);
   assert.equal(anchors.length, 1);

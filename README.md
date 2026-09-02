@@ -201,7 +201,10 @@ const verdict = verifyLedger(entries, {
 
 `acta mcp -- <command>` wraps any stdio MCP server. Everything is forwarded
 untouched; every `tools/call` and its response is recorded, with `isError`
-results marked as failures. Anchors are taken on call *completion*, so a
+results marked as failures. `tools/list` is recorded too, as a call whose
+result is the catalogue, so the definitions the agent was shown sit in the same
+chain as the calls it made against them — a later reader can tell what the
+agent was told a tool would do, not just what it did. Anchors are taken on call *completion*, so a
 pipelined burst of requests cannot double-anchor. The proxy prints each anchor
 line to stderr as it takes one, which is a cheap way to get anchors into a
 host's own log.
@@ -259,8 +262,6 @@ Exit codes from `verify`: 0 verified (or consistent without `--strict`),
   transparency log, a file under `chflags uappnd`. Today the anchor file is
   wherever you point it.
 - Key rotation within a session, and resuming a session across a recorder restart.
-- Recording tool *definitions* alongside calls, so a later reader can tell what
-  the agent was told a tool would do.
 
 ## License
 
