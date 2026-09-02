@@ -153,6 +153,8 @@ export function loadPublicKey(path: string): KeyObject {
 export interface ReadProblem {
   line: number;
   message: string;
+  /** Set when the ledger file itself is absent, as opposed to a line in it being bad. */
+  missing?: boolean;
 }
 
 export interface ReadResult {
@@ -183,7 +185,7 @@ export function parseLedger(text: string): ReadResult {
 
 export function readLedger(dir: string): ReadResult {
   const path = join(dir, LEDGER_FILE);
-  if (!existsSync(path)) return { entries: [], problems: [{ line: 0, message: `no ${LEDGER_FILE} in ${dir}` }] };
+  if (!existsSync(path)) return { entries: [], problems: [{ line: 0, message: `no ${LEDGER_FILE} in ${dir}`, missing: true }] };
   return parseLedger(readFileSync(path, 'utf8'));
 }
 

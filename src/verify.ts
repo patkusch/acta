@@ -66,10 +66,13 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
   const add = (code: string, severity: Severity, message: string, seq?: number) =>
     findings.push({ code, severity, message, seq });
 
-  for (const p of opts.problems ?? []) add('UNPARSEABLE', 'tamper', `line ${p.line}: ${p.message}`);
+  for (const p of opts.problems ?? []) {
+    if (p.missing) add('MISSING', 'tamper', `${p.message} — if an anchor exists for this session, the record was removed whole`);
+    else add('UNPARSEABLE', 'tamper', `line ${p.line}: ${p.message}`);
+  }
 
   if (entries.length === 0) {
-    add('EMPTY', 'tamper', 'no entries');
+    if (!findings.some((f) => f.code === 'MISSING')) add('EMPTY', 'tamper', 'no entries');
     return conclude();
   }
 

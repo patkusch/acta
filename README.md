@@ -1,5 +1,7 @@
 # Acta
 
+[![test](https://github.com/patkusch/acta/actions/workflows/test.yml/badge.svg)](https://github.com/patkusch/acta/actions/workflows/test.yml)
+
 **A tamper-evident record of what an agent actually did — and an honest account of what that record does not prove.**
 
 An agent runs for an hour and takes two hundred actions. Afterwards someone asks
@@ -151,7 +153,7 @@ the problem. The two operational rules follow directly from it:
   the thing to hand them.
 - **A missing ledger is not a finding.** If the whole directory is deleted, the
   only evidence it existed is an anchor somewhere else with no ledger to match.
-  `verify` on an empty directory reports `EMPTY`, which is all it can do.
+  `verify` on a directory with no ledger reports `MISSING`, which is all it can do.
 - **Large results are stored by digest.** Bodies over 4 KiB go to a blob store
   beside the ledger. A missing blob is reported as a warning — evidence lost, not
   evidence altered — and the digest still binds whatever is later produced.
@@ -233,6 +235,7 @@ Exit codes from `verify`: 0 verified (or consistent without `--strict`),
 | `TRUNCATED` | tamper | an anchor points past the end of the ledger |
 | `ANCHOR_MISMATCH` | tamper | the anchored entry has a different hash |
 | `UNPARSEABLE` | tamper | a line is not an entry |
+| `MISSING`, `EMPTY` | tamper | no ledger file, or a ledger with no entries |
 | `UNANSWERED_CALL` | warn | a call has no outcome and the session did not close |
 | `CLOCK_REGRESSION` | warn | a timestamp precedes the one before it |
 | `BLOB_MISSING` | warn | a large result body is not in the blob store |

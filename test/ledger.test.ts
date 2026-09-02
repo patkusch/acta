@@ -108,3 +108,10 @@ test('the recorder refuses to append to an existing ledger or answer twice', () 
   assert.throws(() => Recorder.open(dir), /one session per ledger/);
   assert.ok(readFileSync(join(dir, LEDGER_FILE), 'utf8').endsWith('\n'));
 });
+
+test('a missing ledger is reported as MISSING, not as a parse error', () => {
+  const { entries, problems } = readLedger(join(scratch(), 'never-written'));
+  const v = verifyLedger(entries, { problems });
+  assert.equal(v.status, 'tampered');
+  assert.deepEqual(v.findings.map((f) => f.code), ['MISSING']);
+});
