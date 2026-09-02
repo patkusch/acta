@@ -115,3 +115,23 @@ test('a missing ledger is reported as MISSING, not as a parse error', () => {
   assert.equal(v.status, 'tampered');
   assert.deepEqual(v.findings.map((f) => f.code), ['MISSING']);
 });
+
+test('a session that crashed mid-call is a warning, not tampering — and looks the same as a truncation', async () => {
+  const dir = scratch();
+  const rec = Recorder.open(dir);
+  const id = rec.call('shell', { cmd: 'npm test' });
+  rec.note('the process died here');
+  void id;
+  // no result, no close — the recorder was killed.
+  const { entries } = readLedger(dir);
+  const v = verifyLedger(entries, { trustedKey: loadPublicKey(join(dir, PUB_FILE)) });
+  assert.notEqual(v.status, 'tampered');
+  assert.deepEqual(
+    v.findings.filter((f) => f.severity === 'warn').map((f) => f.code),
+    ['UNANSWERED_CALL'],
+  );
+  // Only an anchor taken after the crash point can tell a crash from a cut.
+  const later = { session: rec.session, seq: 5, hash: 'a'.repeat(64), at: '' };
+  const cut = verifyLedger(entries, { anchors: [later] });
+  assert.ok(cut.findings.some((f) => f.code === 'TRUNCATED'));
+});

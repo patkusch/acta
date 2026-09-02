@@ -74,6 +74,13 @@ Five kinds: `open` (genesis, declares the session and the public key), `call`,
 The verifier lists what is missing before a `consistent` ledger could become
 `verified`. `--strict` makes `consistent` a non-zero exit, for CI.
 
+A session that crashed mid-call is not tampering. Its last call has no result
+and there is no `close`; the verifier reports `UNANSWERED_CALL` as a warning
+and the verdict stands. The same file with its tail cut off looks identical —
+which is why the truncate row in the table below is caught by nothing but an
+anchor. A result that is missing when the `close` entry says it should be there
+is a different matter: that is `RESULT_REMOVED`, and it is tampering.
+
 ```
 $ acta verify run-42
 CONSISTENT  4 entries  head seq 3 db121670a2ec…
