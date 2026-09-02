@@ -1,14 +1,14 @@
 /**
  * acta init   [dir]                          create a ledger directory and key pair
- * acta verify [dir] [--key pem] [--anchors file] [--strict] [--json]
- * acta anchor [dir] [--to file]              write the current head as an anchor
+ * acta verify [dir] [--key pem] [--anchors file] [--git [--repo path]] [--strict] [--json]
+ * acta anchor [dir] [--to file] [--git [--repo path]]   write the current head as an anchor
  * acta show   [dir]                          print the timeline
  * acta mcp    [--dir d] [--anchor-every n] [--anchor-to file] -- <command...>
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-import { readAnchors, formatAnchor, writeAnchor } from './anchor.ts';
+import { readAnchors, formatAnchor, writeAnchor, writeGitAnchor, readGitAnchors } from './anchor.ts';
 import { BLOB_DIR, PUB_FILE, loadOrCreateKeys, loadPublicKey, readLedger, fingerprint, type Entry } from './ledger.ts';
 import { verifyLedger, type Verdict } from './verify.ts';
 import { startProxy } from './mcp/proxy.ts';
@@ -45,8 +45,8 @@ function usage(code: number): never {
     [
       'usage:',
       '  acta init   [dir]',
-      '  acta verify [dir] [--key recorder.pub] [--anchors anchors.jsonl] [--strict] [--json]',
-      '  acta anchor [dir] [--to anchors.jsonl]',
+      '  acta verify [dir] [--key recorder.pub] [--anchors anchors.jsonl] [--git [--repo path]] [--strict] [--json]',
+      '  acta anchor [dir] [--to anchors.jsonl] [--git [--repo path]]',
       '  acta show   [dir]',
       '  acta mcp    [--dir .acta] [--anchor-every N] [--anchor-to file] -- <command> [args...]',
     ].join('\n'),
@@ -74,10 +74,14 @@ switch (command) {
     const { entries, problems } = readLedger(dir);
     const keyPath = flag('--key');
     const anchorsPath = flag('--anchors');
+    const anchors = [
+      ...(anchorsPath ? readAnchors(anchorsPath) : []),
+      ...(has('--git') ? readGitAnchors({ cwd: flag('--repo') }) : []),
+    ];
     const verdict = verifyLedger(entries, {
       problems,
       trustedKey: keyPath ? loadPublicKey(keyPath) : undefined,
-      anchors: anchorsPath ? readAnchors(anchorsPath) : undefined,
+      anchors: anchorsPath || has('--git') ? anchors : undefined,
       blob: (digest) => {
         const p = join(dir, BLOB_DIR, digest);
         return existsSync(p) ? readFileSync(p) : undefined;
@@ -103,6 +107,7 @@ switch (command) {
     const anchor = { session: open.session, seq: head.seq, hash: head.hash, at: new Date().toISOString() };
     const to = flag('--to');
     if (to) writeAnchor(resolve(to), anchor);
+    if (has('--git')) writeGitAnchor(anchor, { cwd: flag('--repo') });
     console.log(formatAnchor(anchor));
     break;
   }

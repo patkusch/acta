@@ -220,6 +220,18 @@ acta mcp    [--dir d] [--anchor-every N] [--anchor-to file] -- <command> [args..
 Exit codes from `verify`: 0 verified (or consistent without `--strict`),
 1 tampered, 3 consistent under `--strict`.
 
+### Anchoring into git
+
+`acta anchor <dir> --git` appends the anchor line as a git note on `HEAD` under
+`refs/notes/acta`; `acta verify <dir> --git` reads every anchor back from that
+ref. Locally this is no stronger than a file the same user can write. The point
+is the next step:
+
+```bash
+git push origin refs/notes/acta                      # a copy the agent needs push rights to alter
+git fetch origin refs/notes/acta:refs/notes/acta     # a reviewer verifies against that copy, not the local one
+```
+
 ## Findings reference
 
 | code | severity | meaning |
@@ -258,9 +270,9 @@ Exit codes from `verify`: 0 verified (or consistent without `--strict`),
 
 ## Not built
 
-- An anchor sink that is append-only by construction — a git note, a signed
-  transparency log, a file under `chflags uappnd`. Today the anchor file is
-  wherever you point it.
+- An anchor sink that is append-only by construction — a signed transparency
+  log, a file under `chflags uappnd`. Git notes are supported, but a note is
+  only append-only once it has been pushed somewhere the agent cannot.
 - Key rotation within a session, and resuming a session across a recorder restart.
 
 ## License

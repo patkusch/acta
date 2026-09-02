@@ -56,3 +56,49 @@ export function readAnchors(path: string): Anchor[] {
     .map(parseAnchorLine)
     .filter((a): a is Anchor => a !== undefined);
 }
+
+// --- git notes as an anchor sink --------------------------------------------
+//
+// A note on HEAD in a dedicated ref. Locally this is no stronger than a file
+// the same user can write. Its value is that `git push origin refs/notes/acta`
+// puts a copy somewhere the agent needs push rights to alter, and a reviewer
+// can `git fetch origin refs/notes/acta:refs/notes/acta` and verify against
+// the remote copy rather than the local one.
+
+import { execFileSync } from 'node:child_process';
+
+export interface GitAnchorOptions {
+  cwd?: string;
+  ref?: string;
+}
+
+export const GIT_NOTES_REF = 'acta';
+
+export function writeGitAnchor(a: Anchor, opts: GitAnchorOptions = {}): void {
+  execFileSync('git', ['notes', `--ref=${opts.ref ?? GIT_NOTES_REF}`, 'append', '-m', formatAnchor(a), 'HEAD'], {
+    cwd: opts.cwd,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+}
+
+/** Every anchor line in every note under the ref. An absent ref is simply no anchors. */
+export function readGitAnchors(opts: GitAnchorOptions = {}): Anchor[] {
+  const ref = opts.ref ?? GIT_NOTES_REF;
+  let list: string;
+  try {
+    list = execFileSync('git', ['notes', `--ref=${ref}`, 'list'], { cwd: opts.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    return [];
+  }
+  const anchors: Anchor[] = [];
+  for (const line of list.split('\n')) {
+    const [noteObject] = line.trim().split(/\s+/);
+    if (!noteObject) continue;
+    const text = execFileSync('git', ['cat-file', '-p', noteObject], { cwd: opts.cwd, encoding: 'utf8' });
+    for (const l of text.split('\n')) {
+      const a = parseAnchorLine(l);
+      if (a) anchors.push(a);
+    }
+  }
+  return anchors;
+}
