@@ -9,9 +9,9 @@
     "acta": "bin/acta.mjs"
   },
   "scripts": {
-    "test": "node --test test/*.test.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
     "lint": "tsc --noEmit",
-    "attack": "node scripts/attack.ts"
+    "attack": "node --experimental-strip-types scripts/attack.ts"
   },
   "engines": {
     "node": ">=22.6"
