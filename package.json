@@ -1,18 +1,21 @@
 {
   "name": "acta",
   "version": "0.1.0",
-  "description": "A tamper-evident record of what an agent actually did — hash-chained, signed, anchored, and honest about what that does not prove.",
+  "description": "A tamper-evident record of what an agent actually did \u2014 hash-chained, signed, anchored, and honest about what that does not prove.",
   "license": "MIT",
   "type": "module",
   "private": true,
-  "bin": { "acta": "bin/acta.mjs" },
+  "bin": {
+    "acta": "bin/acta.mjs"
+  },
   "scripts": {
     "test": "node --test test/*.test.ts",
     "lint": "tsc --noEmit",
-    "attack": "node scripts/attack.ts",
-    "demo": "node scripts/demo.ts"
+    "attack": "node scripts/attack.ts"
   },
-  "engines": { "node": ">=22.6" },
+  "engines": {
+    "node": ">=22.6"
+  },
   "devDependencies": {
     "@types/node": "^22.14.0",
     "typescript": "~5.8.2"
