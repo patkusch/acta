@@ -60,6 +60,11 @@ export type Body = Base &
       }
     | { kind: 'note'; text: string }
     | {
+        kind: 'rotate';
+        /** SPKI DER, base64: the new key that signs entries after this one. */
+        pub: string;
+      }
+    | {
         kind: 'resume';
         /** Seq of the entry this resume continues from — the head at restart. */
         from: number;

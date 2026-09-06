@@ -114,6 +114,12 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
   }
 
   // --- the chain -------------------------------------------------------------
+  // The key can change mid-session. A `rotate` entry is signed by the retiring
+  // key and declares the next, so trust flows forward along a signed succession:
+  // a reviewer who trusts the original key trusts every later key it vouched for.
+  // `currentKey` is the key in force for the entry being checked; it advances
+  // *after* a rotate is verified, never before.
+  let currentKey = key;
   const calls = new Map<string, number>();
   const answered = new Map<string, number>();
   let prevHash = GENESIS_PREV;
@@ -129,7 +135,7 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
     if (i > 0 && entry.prev !== prevHash) add('CHAIN_BREAK', 'tamper', 'prev does not match the previous entry', i);
     if (i > 0 && entry.kind === 'open') add('SECOND_GENESIS', 'tamper', 'a second `open` entry', i);
 
-    if (key && !verifySignature(entry.hash, entry.sig, key)) {
+    if (currentKey && !verifySignature(entry.hash, entry.sig, currentKey)) {
       add('BAD_SIGNATURE', 'tamper', 'signature does not verify', i);
     }
 
@@ -153,6 +159,17 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
           const blob = opts.blob(entry.digest);
           if (!blob) add('BLOB_MISSING', 'warn', `result body ${entry.digest.slice(0, 12)}… not found in blob store`, i);
           else if (sha256(blob) !== entry.digest) add('BLOB_MISMATCH', 'tamper', 'stored result body does not match its digest', i);
+        }
+        break;
+      }
+      case 'rotate': {
+        // The signature above was checked against the retiring key. Now trust
+        // moves to the key this entry declares, for every entry that follows.
+        try {
+          currentKey = publicKeyFromBase64(entry.pub);
+        } catch {
+          add('BAD_ROTATE_KEY', 'tamper', 'rotate entry declares an unreadable public key', i);
+          currentKey = undefined; // nothing after this can be trusted to a readable key
         }
         break;
       }

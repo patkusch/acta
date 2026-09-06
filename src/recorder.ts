@@ -18,6 +18,8 @@ import {
   BLOB_DIR,
   GENESIS_PREV,
   LEDGER_FILE,
+  KEY_FILE,
+  PUB_FILE,
   loadOrCreateKeys,
   publicKeyToBase64,
   readLedger,
@@ -45,7 +47,7 @@ export interface ResultOptions {
 export class Recorder {
   readonly dir: string;
   readonly session: string;
-  private readonly key: KeyObject;
+  private key: KeyObject;
   private readonly fd: number;
   private readonly clock: () => Date;
   private readonly inlineLimit: number;
@@ -105,12 +107,13 @@ export class Recorder {
     }
     const keys = opts.keys ?? loadOrCreateKeys(dir);
     const { entries, problems } = readLedger(dir);
-    const verdict = verifyLedger(entries, { trustedKey: keys.publicKey, problems });
+    // Self-attested: confirm the chain is structurally sound (hashes, chain,
+    // signatures against its own declared keys). Authenticity to a third party is
+    // the verifier's job with an out-of-band key; resume only needs a base that
+    // is not broken, and proof that it holds the key currently in force.
+    const verdict = verifyLedger(entries, { problems });
     if (verdict.status === 'tampered') {
-      const keyMismatch = verdict.findings.some((f) => f.code === 'KEY_MISMATCH');
-      const detail = keyMismatch
-        ? 'the key here does not match the one that signed it — resume needs the original recorder key'
-        : verdict.findings.filter((f) => f.severity === 'tamper').map((f) => f.code).join(', ');
+      const detail = verdict.findings.filter((f) => f.severity === 'tamper').map((f) => f.code).join(', ');
       throw new Error(`refusing to resume a tampered ledger (${detail})`);
     }
     const last = entries[entries.length - 1];
@@ -118,6 +121,12 @@ export class Recorder {
       throw new Error('refusing to resume a closed session; close is final — start a new session instead');
     }
     const genesis = entries[0] as Extract<Entry, { kind: 'open' }>;
+    // The current signing key is the genesis key, advanced by every rotation.
+    let currentPub = genesis.pub;
+    for (const e of entries) if (e.kind === 'rotate') currentPub = e.pub;
+    if (publicKeyToBase64(keys.publicKey) !== currentPub) {
+      throw new Error('resume needs the current recorder key — the one named by the ledger\'s latest key declaration');
+    }
     const fd = openSync(ledgerPath, 'a');
     const rec = new Recorder(dir, keys.privateKey, fd, genesis.session, opts);
     rec.seq = last.seq + 1;
@@ -170,6 +179,25 @@ export class Recorder {
 
   note(text: string): void {
     this.append({ kind: 'note', text });
+  }
+
+  /**
+   * Retire the current signing key and continue under a new one, without ending
+   * the session. The `rotate` entry is signed by the *outgoing* key — it is the
+   * current holder's authorisation of the successor, so trust flows forward: a
+   * reviewer who trusts the original key trusts every key it later vouched for.
+   * An attacker who cannot sign with the current key cannot insert a rotation.
+   *
+   * The new private key is written to the ledger directory so a later resume
+   * finds the key now in force. Persisting happens after the entry, so a crash
+   * in between leaves the old key on disk and the mismatch simply refuses to
+   * resume — it never continues under a key the chain did not name.
+   */
+  rotate(newKeys: { privateKey: KeyObject; publicKey: KeyObject }): void {
+    this.append({ kind: 'rotate', pub: publicKeyToBase64(newKeys.publicKey) });
+    this.key = newKeys.privateKey;
+    writeFileSync(join(this.dir, KEY_FILE), newKeys.privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+    writeFileSync(join(this.dir, PUB_FILE), newKeys.publicKey.export({ type: 'spki', format: 'pem' }));
   }
 
   /**

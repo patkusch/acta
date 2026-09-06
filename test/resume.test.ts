@@ -89,7 +89,7 @@ test('resume refuses a ledger it does not hold the original key for', () => {
   const rec = Recorder.open(dir, { session: 'run-3', keys: original });
   rec.result(rec.call('noop', {}), {});
   // no close; a different recorder with a different key tries to take over
-  assert.throws(() => Recorder.resume(dir, { keys: generateKeys() }), /original recorder key/i);
+  assert.throws(() => Recorder.resume(dir, { keys: generateKeys() }), /current recorder key/i);
 });
 
 test('a resume entry cannot lie about where it continued from, even signed with the real key', () => {

@@ -19,6 +19,8 @@ export function describe(e: Entry): string {
       return head + `note ${e.text}`;
     case 'resume':
       return head + `${BOLD}resume${OFF} from seq ${e.from} ${DIM}${e.fromHash.slice(0, 12)}…${OFF}${e.actor ? ` (${e.actor})` : ''}`;
+    case 'rotate':
+      return head + `${BOLD}rotate${OFF} to key ${fingerprint(publicKeyFromBase64(e.pub))}`;
     case 'close':
       return head + `${BOLD}close${OFF} ${e.calls} calls, ${e.results} results${e.open.length ? `, ${e.open.length} still open` : ''}`;
   }
