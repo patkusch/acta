@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
 import { Recorder, type RecorderOptions } from '../recorder.ts';
-import { LEDGER_FILE } from '../ledger.ts';
+import { LEDGER_FILE, generateKeys } from '../ledger.ts';
 
 interface JsonRpc {
   jsonrpc: '2.0';
@@ -34,14 +34,18 @@ export interface ProxyOptions extends RecorderOptions {
   anchorAppendOnly?: boolean;
   /** Continue an existing ledger in `dir` if one is there, rather than refusing it. */
   resume?: boolean;
+  /** On resume, retire the pre-crash key and continue under a fresh one. */
+  rotateOnResume?: boolean;
   onAnchor?: (line: string) => void;
 }
 
 export function startProxy(command: string, args: string[], options: ProxyOptions) {
-  const rec =
-    options.resume && existsSync(join(options.dir, LEDGER_FILE))
-      ? Recorder.resume(options.dir, options)
-      : Recorder.open(options.dir, options);
+  const resuming = Boolean(options.resume) && existsSync(join(options.dir, LEDGER_FILE));
+  const rec = resuming ? Recorder.resume(options.dir, options) : Recorder.open(options.dir, options);
+  // Retiring the pre-crash key on resume limits the blast radius if whatever
+  // took the recorder down also exposed its key: entries after the restart are
+  // signed by a fresh key, and the original still verifies everything before it.
+  if (resuming && options.rotateOnResume) rec.rotate(generateKeys());
   const server = spawn(command, args, { stdio: ['pipe', 'pipe', 'inherit'] });
 
   /**

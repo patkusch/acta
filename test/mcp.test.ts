@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
-import { readLedger, loadPublicKey, PUB_FILE, type Entry } from '../src/ledger.ts';
+import { readLedger, loadPublicKey, publicKeyFromBase64, PUB_FILE, type Entry } from '../src/ledger.ts';
 import { verifyLedger } from '../src/verify.ts';
 import { readAnchors } from '../src/anchor.ts';
 
@@ -125,4 +125,56 @@ test('the proxy resumes a crashed run in the same ledger, and the whole thing st
 
   const v = verifyLedger(entries, { trustedKey: loadPublicKey(join(dir, PUB_FILE)) });
   assert.notEqual(v.status, 'tampered', JSON.stringify(v.findings));
+});
+
+test('--rotate-on-resume retires the pre-crash key; the original still verifies the whole chain', async () => {
+  const dir = join(mkdtempSync(join(tmpdir(), 'acta-')), 'ledger');
+  const drive = (extraArgs: string[], calls: Array<Record<string, unknown>>, onReady: (p: ReturnType<typeof spawn>) => void) =>
+    new Promise<void>((resolveDone) => {
+      const proxy = spawn(
+        process.execPath,
+        ['bin/acta.mjs', 'mcp', '--dir', dir, ...extraArgs, '--', process.execPath, 'test/fake-mcp-server.mjs'],
+        { stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      const responses: Array<Record<string, unknown>> = [];
+      createInterface({ input: proxy.stdout }).on('line', (l) => {
+        responses.push(JSON.parse(l));
+        if (responses.length >= calls.length) onReady(proxy);
+      });
+      proxy.on('exit', () => resolveDone());
+      for (const m of calls) proxy.stdin!.write(JSON.stringify(m) + '\n');
+    });
+
+  await drive(
+    [],
+    [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'echo', arguments: { text: 'before' } } },
+    ],
+    (proxy) => proxy.kill('SIGKILL'),
+  );
+
+  // Capture the pre-crash public key out of band, before the rotation overwrites it.
+  const genesisPub = readFileSync(join(dir, PUB_FILE), 'utf8');
+
+  await drive(
+    ['--rotate-on-resume'],
+    [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'echo', arguments: { text: 'after' } } },
+    ],
+    (proxy) => proxy.stdin!.end(),
+  );
+
+  const { entries } = readLedger(dir);
+  assert.ok(entries.some((e) => e.kind === 'rotate'), 'the resume rotated to a fresh key');
+  // The key file on disk is now the fresh key, not the genesis one.
+  assert.notEqual(readFileSync(join(dir, PUB_FILE), 'utf8'), genesisPub, 'the pre-crash key was retired on disk');
+
+  // Verified against the ORIGINAL key, captured before the rotation, across the handover.
+  const v = verifyLedger(entries, { trustedKey: loadPublicKey(join(dir, PUB_FILE)) });
+  assert.equal(v.status, 'tampered', 'the retired key no longer verifies the genesis it did not sign');
+  const original = publicKeyFromBase64((entries[0] as Extract<Entry, { kind: 'open' }>).pub);
+  const good = verifyLedger(entries, { trustedKey: original });
+  assert.notEqual(good.status, 'tampered', `the original key verifies across the rotation: ${JSON.stringify(good.findings)}`);
 });
