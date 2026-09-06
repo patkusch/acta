@@ -26,6 +26,8 @@ export interface ProxyOptions extends RecorderOptions {
   /** Anchor every N recorded calls to this path. */
   anchorEvery?: number;
   anchorTo?: string;
+  /** Make the anchor sink append-only (kernel-enforced); requires anchorTo. */
+  anchorAppendOnly?: boolean;
   onAnchor?: (line: string) => void;
 }
 
@@ -119,7 +121,7 @@ export function startProxy(command: string, args: string[], options: ProxyOption
 
   function maybeAnchor() {
     if (!options.anchorEvery || completed % options.anchorEvery !== 0) return;
-    rec.anchor(options.anchorTo);
+    rec.anchor(options.anchorTo, { appendOnly: options.anchorAppendOnly });
     options.onAnchor?.(rec.anchorLine());
   }
 

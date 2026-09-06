@@ -12,7 +12,7 @@ import { closeSync, existsSync, mkdirSync, openSync, writeFileSync, writeSync } 
 import { join } from 'node:path';
 
 import { canon, sha256 } from './canon.ts';
-import { formatAnchor, writeAnchor, type Anchor } from './anchor.ts';
+import { formatAnchor, writeAnchor, writeAppendOnlyAnchor, type Anchor } from './anchor.ts';
 import {
   ANCHOR_FILE,
   BLOB_DIR,
@@ -117,10 +117,16 @@ export class Recorder {
     this.append({ kind: 'note', text });
   }
 
-  /** Write the current head somewhere. Default is inside the ledger dir, which is the weakest place for it. */
-  anchor(to: string = join(this.dir, ANCHOR_FILE)): Anchor {
+  /**
+   * Write the current head somewhere. Default is inside the ledger dir, which is
+   * the weakest place for it. With `appendOnly`, the sink is made append-only by
+   * the kernel so a past anchor cannot be removed or rewritten — throws on a
+   * platform that cannot do that rather than writing an unprotected file.
+   */
+  anchor(to: string = join(this.dir, ANCHOR_FILE), opts: { appendOnly?: boolean } = {}): Anchor {
     const a: Anchor = { session: this.session, seq: this.head.seq, hash: this.head.hash, at: this.now() };
-    writeAnchor(to, a);
+    if (opts.appendOnly) writeAppendOnlyAnchor(to, a);
+    else writeAnchor(to, a);
     return a;
   }
 

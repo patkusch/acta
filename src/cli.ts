@@ -1,14 +1,14 @@
 /**
  * acta init   [dir]                          create a ledger directory and key pair
  * acta verify [dir] [--key pem] [--anchors file] [--git [--repo path]] [--strict] [--json]
- * acta anchor [dir] [--to file] [--git [--repo path]]   write the current head as an anchor
+ * acta anchor [dir] [--to file] [--append-to file] [--git [--repo path]]   write the current head as an anchor
  * acta show   [dir]                          print the timeline
- * acta mcp    [--dir d] [--anchor-every n] [--anchor-to file] -- <command...>
+ * acta mcp    [--dir d] [--anchor-every n] [--anchor-to file | --anchor-append-to file] -- <command...>
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-import { readAnchors, formatAnchor, writeAnchor, writeGitAnchor, readGitAnchors } from './anchor.ts';
+import { readAnchors, formatAnchor, writeAnchor, writeGitAnchor, readGitAnchors, writeAppendOnlyAnchor, appendOnlySupport } from './anchor.ts';
 import { BLOB_DIR, PUB_FILE, loadOrCreateKeys, loadPublicKey, readLedger, fingerprint, type Entry } from './ledger.ts';
 import { verifyLedger, type Verdict } from './verify.ts';
 import { startProxy } from './mcp/proxy.ts';
@@ -46,9 +46,9 @@ function usage(code: number): never {
       'usage:',
       '  acta init   [dir]',
       '  acta verify [dir] [--key recorder.pub] [--anchors anchors.jsonl] [--git [--repo path]] [--strict] [--json]',
-      '  acta anchor [dir] [--to anchors.jsonl] [--git [--repo path]]',
+      '  acta anchor [dir] [--to anchors.jsonl] [--append-to anchors.jsonl] [--git [--repo path]]',
       '  acta show   [dir]',
-      '  acta mcp    [--dir .acta] [--anchor-every N] [--anchor-to file] -- <command> [args...]',
+      '  acta mcp    [--dir .acta] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]',
     ].join('\n'),
   );
   process.exit(code);
@@ -107,6 +107,16 @@ switch (command) {
     const anchor = { session: open.session, seq: head.seq, hash: head.hash, at: new Date().toISOString() };
     const to = flag('--to');
     if (to) writeAnchor(resolve(to), anchor);
+    const appendTo = flag('--append-to');
+    if (appendTo) {
+      const support = appendOnlySupport();
+      if (!support.supported) {
+        console.error(`${RED}--append-to unavailable on ${support.platform}: ${support.reason}${OFF}`);
+        console.error(`${DIM}use --to for a plain anchor; it is not append-only protected.${OFF}`);
+        process.exit(1);
+      }
+      writeAppendOnlyAnchor(resolve(appendTo), anchor);
+    }
     if (has('--git')) writeGitAnchor(anchor, { cwd: flag('--repo') });
     console.log(formatAnchor(anchor));
     break;
@@ -125,11 +135,22 @@ switch (command) {
     const target = sep === -1 ? [] : argv.slice(sep + 1);
     if (target.length === 0) usage(2);
     const every = flag('--anchor-every');
+    const anchorAppendTo = flag('--anchor-append-to');
+    if (anchorAppendTo) {
+      const support = appendOnlySupport();
+      if (!support.supported) {
+        console.error(`${RED}--anchor-append-to unavailable on ${support.platform}: ${support.reason}${OFF}`);
+        console.error(`${DIM}use --anchor-to for a plain sink; it is not append-only protected.${OFF}`);
+        process.exit(1);
+      }
+    }
+    const anchorTo = anchorAppendTo ?? flag('--anchor-to');
     startProxy(target[0], target.slice(1), {
       dir: resolve(flag('--dir') ?? '.acta'),
       actor: flag('--actor'),
       anchorEvery: every ? Number(every) : undefined,
-      anchorTo: flag('--anchor-to') ? resolve(flag('--anchor-to')!) : undefined,
+      anchorTo: anchorTo ? resolve(anchorTo) : undefined,
+      anchorAppendOnly: anchorAppendTo !== undefined,
       onAnchor: (line) => console.error(line),
     });
     break;
