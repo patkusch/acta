@@ -8,9 +8,13 @@
  * directory — otherwise the key is inside the thing being recorded.
  */
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
 import { Recorder, type RecorderOptions } from '../recorder.ts';
+import { LEDGER_FILE } from '../ledger.ts';
 
 interface JsonRpc {
   jsonrpc: '2.0';
@@ -28,13 +32,25 @@ export interface ProxyOptions extends RecorderOptions {
   anchorTo?: string;
   /** Make the anchor sink append-only (kernel-enforced); requires anchorTo. */
   anchorAppendOnly?: boolean;
+  /** Continue an existing ledger in `dir` if one is there, rather than refusing it. */
+  resume?: boolean;
   onAnchor?: (line: string) => void;
 }
 
 export function startProxy(command: string, args: string[], options: ProxyOptions) {
-  const rec = Recorder.open(options.dir, options);
+  const rec =
+    options.resume && existsSync(join(options.dir, LEDGER_FILE))
+      ? Recorder.resume(options.dir, options)
+      : Recorder.open(options.dir, options);
   const server = spawn(command, args, { stdio: ['pipe', 'pipe', 'inherit'] });
 
+  /**
+   * A per-run tag on every ledger call id. JSON-RPC ids reset with each host
+   * connection, so across a resume the same id recurs — `rpc-2` in run two would
+   * collide with `rpc-2` from run one, which is still in the rebuilt call set.
+   * The ledger's call-id space is the whole session; this keeps it unique.
+   */
+  const runTag = randomUUID().slice(0, 8);
   /** JSON-RPC id → ledger call id, for requests we are waiting on. */
   const pending = new Map<string, string>();
   /** Completed calls. Anchors are taken on completion, so a pipelined burst cannot double-anchor. */
@@ -81,12 +97,12 @@ export function startProxy(command: string, args: string[], options: ProxyOption
     }
     if (message.method === 'tools/call' && message.id !== undefined) {
       const name = String(message.params?.name ?? '');
-      const callId = rec.call(name, message.params?.arguments ?? {}, { id: `rpc-${message.id}` });
+      const callId = rec.call(name, message.params?.arguments ?? {}, { id: `rpc-${runTag}-${message.id}` });
       pending.set(String(message.id), callId);
     } else if (message.method === 'tools/list' && message.id !== undefined) {
       // The catalogue is recorded as a call so the definitions the agent was
       // shown sit in the same chain as the calls it made against them.
-      const callId = rec.call('tools/list', message.params ?? {}, { id: `rpc-${message.id}` });
+      const callId = rec.call('tools/list', message.params ?? {}, { id: `rpc-${runTag}-${message.id}` });
       pending.set(String(message.id), callId);
     } else if (message.method === 'notifications/cancelled') {
       rec.note(`cancelled: ${JSON.stringify(message.params ?? {})}`);

@@ -3,7 +3,7 @@
  * acta verify [dir] [--key pem] [--anchors file] [--git [--repo path]] [--strict] [--json]
  * acta anchor [dir] [--to file] [--append-to file] [--git [--repo path]]   write the current head as an anchor
  * acta show   [dir]                          print the timeline
- * acta mcp    [--dir d] [--anchor-every n] [--anchor-to file | --anchor-append-to file] -- <command...>
+ * acta mcp    [--dir d] [--resume] [--anchor-every n] [--anchor-to file | --anchor-append-to file] -- <command...>
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -48,7 +48,7 @@ function usage(code: number): never {
       '  acta verify [dir] [--key recorder.pub] [--anchors anchors.jsonl] [--git [--repo path]] [--strict] [--json]',
       '  acta anchor [dir] [--to anchors.jsonl] [--append-to anchors.jsonl] [--git [--repo path]]',
       '  acta show   [dir]',
-      '  acta mcp    [--dir .acta] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]',
+      '  acta mcp    [--dir .acta] [--resume] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]',
     ].join('\n'),
   );
   process.exit(code);
@@ -151,6 +151,7 @@ switch (command) {
       anchorEvery: every ? Number(every) : undefined,
       anchorTo: anchorTo ? resolve(anchorTo) : undefined,
       anchorAppendOnly: anchorAppendTo !== undefined,
+      resume: has('--resume'),
       onAnchor: (line) => console.error(line),
     });
     break;

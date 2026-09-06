@@ -53,7 +53,9 @@ test('the MCP proxy records every tools/call and its response, and anchors on sc
   assert.deepEqual(calls.map((c) => c.tool), ['tools/list', 'echo', 'explode']);
   assert.deepEqual(calls[1].args, { text: 'hi' });
   const results = entries.filter((e): e is Extract<Entry, { kind: 'result' }> => e.kind === 'result');
-  assert.deepEqual(results.map((r) => [r.of, r.ok]), [['rpc-2', true], ['rpc-3', true], ['rpc-4', false]]);
+  // Each result references its call by the ledger id; the last one (explode) failed.
+  assert.deepEqual(results.map((r) => r.of), calls.map((c) => c.id));
+  assert.deepEqual(results.map((r) => r.ok), [true, true, false]);
   // The catalogue the agent was shown is in the chain, with the tool definitions verbatim.
   const catalogue = results[0].body as { tools: { name: string }[] };
   assert.deepEqual(catalogue.tools.map((t) => t.name), ['echo', 'explode']);
@@ -64,4 +66,63 @@ test('the MCP proxy records every tools/call and its response, and anchors on sc
 
   const v = verifyLedger(entries, { trustedKey: loadPublicKey(join(dir, PUB_FILE)), anchors });
   assert.equal(v.status, 'verified', JSON.stringify(v.findings));
+});
+
+test('the proxy resumes a crashed run in the same ledger, and the whole thing still verifies', async () => {
+  const dir = join(mkdtempSync(join(tmpdir(), 'acta-')), 'ledger');
+
+  // A helper: run a proxy, drive it, and return once its responses have arrived.
+  const drive = (
+    extraArgs: string[],
+    calls: Array<Record<string, unknown>>,
+    onReady: (proxy: ReturnType<typeof spawn>) => void,
+  ) =>
+    new Promise<void>((resolveDone) => {
+      const proxy = spawn(
+        process.execPath,
+        ['bin/acta.mjs', 'mcp', '--dir', dir, ...extraArgs, '--', process.execPath, 'test/fake-mcp-server.mjs'],
+        { stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      const responses: Array<Record<string, unknown>> = [];
+      const lines = createInterface({ input: proxy.stdout });
+      lines.on('line', (l) => {
+        responses.push(JSON.parse(l));
+        if (responses.length >= calls.length) onReady(proxy);
+      });
+      proxy.on('exit', () => resolveDone());
+      for (const m of calls) proxy.stdin!.write(JSON.stringify(m) + '\n');
+    });
+
+  // First run: one call, then the recorder is killed mid-flight — no clean close.
+  await drive(
+    [],
+    [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'echo', arguments: { text: 'first' } } },
+    ],
+    (proxy) => proxy.kill('SIGKILL'),
+  );
+
+  const crashed = readLedger(dir).entries;
+  assert.ok(!crashed.some((e) => e.kind === 'close'), 'a killed proxy leaves no close entry');
+
+  // Second run against the same dir with --resume: it continues rather than refusing.
+  await drive(
+    ['--resume'],
+    [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'echo', arguments: { text: 'second' } } },
+    ],
+    (proxy) => proxy.stdin!.end(), // clean shutdown this time -> close entry
+  );
+
+  const { entries } = readLedger(dir);
+  const kinds = entries.map((e) => e.kind);
+  assert.ok(kinds.includes('resume'), 'the resume marker is in the chain');
+  assert.equal(kinds[kinds.length - 1], 'close', 'and the second run closed cleanly');
+  const echoes = entries.filter((e): e is Extract<Entry, { kind: 'call' }> => e.kind === 'call' && e.tool === 'echo');
+  assert.deepEqual(echoes.map((c) => (c.args as { text: string }).text), ['first', 'second'], 'both runs are in one ledger');
+
+  const v = verifyLedger(entries, { trustedKey: loadPublicKey(join(dir, PUB_FILE)) });
+  assert.notEqual(v.status, 'tampered', JSON.stringify(v.findings));
 });
