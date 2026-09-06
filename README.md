@@ -17,7 +17,7 @@ attackers it can and cannot catch.
 
 ```bash
 npm install
-npm test          # 19 tests: the chain, the recorder, the proxy, and every attack in the catalogue
+npm test          # 36 tests: the chain, the recorder, the proxy, resume, key rotation, and every attack in the catalogue
 npm run attack    # the demo: ten attacks, three verifier configurations, one cell that stays red
 
 # record a real MCP server
@@ -54,9 +54,11 @@ canonical form (sorted keys, no whitespace, nothing JSON cannot represent).
  "hash":"9b41…","sig":"MEUCIQ…"}
 ```
 
-Five kinds: `open` (genesis, declares the session and the public key), `call`,
+Seven kinds: `open` (genesis, declares the session and the public key), `call`,
 `result` (which cites its call and carries the body inline or by digest),
-`note`, and `close` (which records the counts and which calls were still open).
+`note`, `rotate` (retires the signing key and declares its successor), `resume`
+(marks a recorder restart and names the head it continues from), and `close`
+(which records the counts and which calls were still open).
 
 ## Three verdicts, not two
 
@@ -224,7 +226,7 @@ acta init   [dir]                                   create a ledger directory an
 acta verify [dir] [--key pem] [--anchors file] [--strict] [--json]
 acta anchor [dir] [--to file] [--append-to file]    write the current head as an anchor
 acta show   [dir]                                   print the timeline
-acta mcp    [--dir d] [--resume] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]
+acta mcp    [--dir d] [--resume [--rotate-on-resume]] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]
 ```
 
 Exit codes from `verify`: 0 verified (or consistent without `--strict`),
@@ -254,6 +256,30 @@ forgery would hide:
   holder cannot forge a continuity that did not happen.
 - **A call in flight at the crash stays open.** Its outcome happened in the gap
   and was never seen, so it is reported as `UNANSWERED_CALL`, not invented.
+
+### Rotating the key
+
+The signing key can change without ending the session. `Recorder.rotate(newKeys)`
+retires the current key and continues under a new one, writing a `rotate` entry
+that declares the successor. Two things make this safe:
+
+- **The rotation is signed by the *outgoing* key.** It is the current holder's
+  authorisation of the next key, so trust flows forward along a signed
+  succession. Someone who cannot sign with the current key cannot insert a
+  rotation — the `rotate`'s own signature is checked against the retiring key,
+  and a forged one is `BAD_SIGNATURE`.
+- **You verify with the *original* key, and it covers the whole chain.** Hand a
+  reviewer the genesis key; the verifier follows each rotation to the next and
+  checks every entry against the key in force when it was written. The current
+  on-disk key is *not* the verification key — verifying against it fails at
+  genesis with `KEY_MISMATCH`, which is the point: the root of trust is the key
+  the session opened with, not the one it happens to hold now.
+
+`acta mcp --rotate-on-resume` rotates on restart, before recording anything more.
+If whatever took the recorder down also exposed its key, the blast radius stops
+at the restart: entries after it are signed by a fresh key, and the original
+still verifies everything before it. This is the answer to the resume caveat that
+a recorder coming back holds a key that may have been exposed in the gap.
 
 ### Anchoring into git
 
@@ -308,6 +334,7 @@ substitute for anchoring somewhere the agent has no write at all.
 | `TRUNCATED` | tamper | an anchor points past the end of the ledger |
 | `ANCHOR_MISMATCH` | tamper | the anchored entry has a different hash |
 | `RESUME_MISMATCH` | tamper | a `resume` marker names an origin that is not the entry before it |
+| `BAD_ROTATE_KEY` | tamper | a `rotate` entry declares an unreadable successor key |
 | `UNPARSEABLE` | tamper | a line is not an entry |
 | `MISSING`, `EMPTY` | tamper | no ledger file, or a ledger with no entries |
 | `UNANSWERED_CALL` | warn | a call has no outcome and the session did not close |
@@ -332,9 +359,8 @@ substitute for anchoring somewhere the agent has no write at all.
 - A signed transparency log as an anchor sink. A local append-only file
   (`--append-to`, `chflags uappnd`) and git notes pushed to a remote are both
   supported; a public append-only log with independent witnesses is not.
-- Key rotation within a session — a `rotate` entry that retires one key and
-  declares the next, so a resumed session can sign with a fresh key while the
-  chain stays verifiable across the handover.
+- Recording tool definitions alongside the calls made against them beyond
+  `tools/list` — a per-call binding to the exact schema in force at call time.
 
 ## License
 
