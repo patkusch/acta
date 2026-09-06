@@ -224,11 +224,36 @@ acta init   [dir]                                   create a ledger directory an
 acta verify [dir] [--key pem] [--anchors file] [--strict] [--json]
 acta anchor [dir] [--to file] [--append-to file]    write the current head as an anchor
 acta show   [dir]                                   print the timeline
-acta mcp    [--dir d] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]
+acta mcp    [--dir d] [--resume] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]
 ```
 
 Exit codes from `verify`: 0 verified (or consistent without `--strict`),
 1 tampered, 3 consistent under `--strict`.
+
+### Resuming after a restart
+
+One session is one ledger file, and by default the recorder refuses to reopen
+one — a second `open` would be a second genesis, and the verifier says so. But a
+recorder that *crashed* leaves a ledger with no `close`, and the run is not over.
+`acta mcp --resume` (and `Recorder.resume(dir)` in the library) continues that
+ledger instead of refusing it, so a restarted proxy records into the same
+session rather than starting a fresh one beside it.
+
+Resume is deliberately narrow, because reopening a record is exactly where a
+forgery would hide:
+
+- **It verifies before it continues.** The existing chain is checked against the
+  recorder's own key first; a tampered, wrong-key, or broken ledger is refused,
+  not appended to. Resuming onto a corrupt base would launder it.
+- **A clean `close` is final.** The verifier reads anything after a `close` as
+  tampering, so there is nowhere sound to append. To continue past a close, start
+  a new session. Only an un-closed (crashed) ledger can be resumed.
+- **The restart is on the record.** The first entry written is a `resume` marker
+  naming the head it continues from. `RESUME_MISMATCH` makes that claim
+  uncounterfeitable — its `fromHash` must equal its own `prev` — so even a key
+  holder cannot forge a continuity that did not happen.
+- **A call in flight at the crash stays open.** Its outcome happened in the gap
+  and was never seen, so it is reported as `UNANSWERED_CALL`, not invented.
 
 ### Anchoring into git
 
@@ -282,6 +307,7 @@ substitute for anchoring somewhere the agent has no write at all.
 | `BODY_MISMATCH`, `BLOB_MISMATCH` | tamper | a result body does not match its digest |
 | `TRUNCATED` | tamper | an anchor points past the end of the ledger |
 | `ANCHOR_MISMATCH` | tamper | the anchored entry has a different hash |
+| `RESUME_MISMATCH` | tamper | a `resume` marker names an origin that is not the entry before it |
 | `UNPARSEABLE` | tamper | a line is not an entry |
 | `MISSING`, `EMPTY` | tamper | no ledger file, or a ledger with no entries |
 | `UNANSWERED_CALL` | warn | a call has no outcome and the session did not close |
@@ -306,7 +332,9 @@ substitute for anchoring somewhere the agent has no write at all.
 - A signed transparency log as an anchor sink. A local append-only file
   (`--append-to`, `chflags uappnd`) and git notes pushed to a remote are both
   supported; a public append-only log with independent witnesses is not.
-- Key rotation within a session, and resuming a session across a recorder restart.
+- Key rotation within a session — a `rotate` entry that retires one key and
+  declares the next, so a resumed session can sign with a fresh key while the
+  chain stays verifiable across the handover.
 
 ## License
 
