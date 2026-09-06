@@ -153,7 +153,9 @@ the problem. The two operational rules follow directly from it:
   `ts` is the recorder's clock and is only asserted. A key holder can write any
   timestamp they like, subject to the verifier's monotonicity warning.
 - **An anchor is as good as where you put it.** An anchor the agent can overwrite
-  is decoration. The library makes anchors small; it cannot make them safe.
+  is decoration. The library makes anchors small, and `--append-to` makes a local
+  sink the kernel will not let the agent rewrite, but neither can beat putting the
+  anchor somewhere the agent has no write at all.
 - **Single writer.** One recorder, one key, one session per file. This is not a
   distributed log and does not pretend to be. There is no consensus and no
   witness set. If you need multiple independent parties to attest, the anchor is
@@ -182,6 +184,7 @@ rec.result(id, { by: 'operator', decision: 'yes' });
 rec.note('operator was shown the consent card, not a summary of it');
 
 rec.anchor('/var/anchors/run-42');               // one line, appended
+rec.anchor('/var/anchors/run-42', { appendOnly: true }); // kernel-enforced append-only sink
 console.log(rec.anchorLine());                   // acta-anchor session=… seq=… hash=… — paste it anywhere
 rec.close();
 ```
@@ -219,9 +222,9 @@ host's own log.
 ```
 acta init   [dir]                                   create a ledger directory and key pair
 acta verify [dir] [--key pem] [--anchors file] [--strict] [--json]
-acta anchor [dir] [--to file]                       write the current head as an anchor
+acta anchor [dir] [--to file] [--append-to file]    write the current head as an anchor
 acta show   [dir]                                   print the timeline
-acta mcp    [--dir d] [--anchor-every N] [--anchor-to file] -- <command> [args...]
+acta mcp    [--dir d] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]
 ```
 
 Exit codes from `verify`: 0 verified (or consistent without `--strict`),
@@ -238,6 +241,29 @@ is the next step:
 git push origin refs/notes/acta                      # a copy the agent needs push rights to alter
 git fetch origin refs/notes/acta:refs/notes/acta     # a reviewer verifies against that copy, not the local one
 ```
+
+### An append-only anchor sink
+
+Anchoring off the machine is the strong move; when it has to stay local, the
+anchor file is only as safe as its permissions. `acta anchor <dir> --append-to
+<file>` (and `acta mcp --anchor-append-to <file>`) writes to a file the kernel
+marks append-only — `chflags uappnd` on macOS and the BSDs. With the flag set,
+the OS permits appends and refuses truncation, in-place rewrite and unlink.
+
+Append-only is precisely the right strength, and no more, because **anchors are
+monotonic evidence**. An attacker holding the recorder key can append a new
+anchor that matches a rewritten ledger — the sink allows that — but cannot
+remove the honest anchor already in the file, and one surviving honest anchor no
+longer matches the rewrite, so the rewrite is caught. More anchors can only
+catch more, never fewer.
+
+The honest boundary: `uappnd` is a *user* flag its owner can clear with `chflags
+nouappnd`. It stops an agent whose tools are read, write and delete but not
+`chflags`; it does not stop the file's owner, and it is not the system-immutable
+flag (`schg`, root and a reboot to clear). On Linux — where the equivalent is
+`chattr +a` and needs `CAP_LINUX_IMMUTABLE` — the command refuses rather than
+writing a file that only looks protected. This is a higher local bar, not a
+substitute for anchoring somewhere the agent has no write at all.
 
 ## Findings reference
 
@@ -277,9 +303,9 @@ git fetch origin refs/notes/acta:refs/notes/acta     # a reviewer verifies again
 
 ## Not built
 
-- An anchor sink that is append-only by construction — a signed transparency
-  log, a file under `chflags uappnd`. Git notes are supported, but a note is
-  only append-only once it has been pushed somewhere the agent cannot.
+- A signed transparency log as an anchor sink. A local append-only file
+  (`--append-to`, `chflags uappnd`) and git notes pushed to a remote are both
+  supported; a public append-only log with independent witnesses is not.
 - Key rotation within a session, and resuming a session across a recorder restart.
 
 ## License
