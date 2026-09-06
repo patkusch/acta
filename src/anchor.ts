@@ -102,3 +102,89 @@ export function readGitAnchors(opts: GitAnchorOptions = {}): Anchor[] {
   }
   return anchors;
 }
+
+// --- an append-only file as an anchor sink ----------------------------------
+//
+// The default anchor file is only as strong as the permissions on it: an agent
+// that can write the ledger directory can rewrite the anchors sitting beside it,
+// and a rewritten anchor that agrees with a rewritten ledger reads as verified.
+// A file the kernel marks append-only closes that gap for an agent whose tools
+// perform ordinary file writes. With the flag set, the OS permits appends and
+// rejects truncation, in-place rewrite and unlink — so the one thing an attacker
+// holding the recorder key needs to do to a past anchor, overwrite it, is the one
+// thing the kernel refuses.
+//
+// The honest boundary: this is `chflags uappnd` (BSD/macOS), a *user* flag the
+// file's owner can clear with `chflags nouappnd`. It defeats an agent confined to
+// file-read/write/delete tools that do not include chflags; it does not defeat the
+// owner, and it is not the system-immutable flag (`schg`), which needs root and a
+// reboot to a lower securelevel to clear. On Linux the equivalent is `chattr +a`
+// (needs CAP_LINUX_IMMUTABLE), which is not wired up here; on those platforms this
+// sink reports itself unsupported rather than writing a file that only looks
+// protected.
+
+import { closeSync, openSync } from 'node:fs';
+
+/** UF_APPEND in the BSD st_flags bitfield: user append-only. */
+const UF_APPEND = 0x4;
+
+export type AppendOnlySupport =
+  | { supported: true; platform: NodeJS.Platform; how: string }
+  | { supported: false; platform: NodeJS.Platform; reason: string };
+
+/** Whether this platform can make a file append-only in a way this module sets and reads. */
+export function appendOnlySupport(): AppendOnlySupport {
+  const platform = process.platform;
+  if (platform === 'darwin' || platform === 'freebsd' || platform === 'openbsd' || platform === 'netbsd') {
+    return { supported: true, platform, how: 'chflags uappnd' };
+  }
+  if (platform === 'linux') {
+    return { supported: false, platform, reason: 'append-only here is `chattr +a`, which needs CAP_LINUX_IMMUTABLE and is not wired up' };
+  }
+  return { supported: false, platform, reason: `no append-only file flag is wired up for ${platform}` };
+}
+
+/**
+ * Does this file currently carry the OS append-only flag? False on platforms
+ * this module does not support, and false — not an error — for a file that does
+ * not exist, so a caller can treat "unprotected" and "absent" the same way.
+ */
+export function isAppendOnly(path: string): boolean {
+  if (!appendOnlySupport().supported) return false;
+  // Node's fs.Stats does not expose BSD st_flags, so read them out of band.
+  // A missing file (or any stat failure) reads as unprotected, not an error.
+  try {
+    const flags = Number(execFileSync('stat', ['-f', '%f', path], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim());
+    return Number.isFinite(flags) && (flags & UF_APPEND) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function setAppendOnly(path: string): void {
+  execFileSync('chflags', ['uappnd', path], { stdio: ['ignore', 'ignore', 'pipe'] });
+}
+
+/**
+ * Append an anchor to a file the OS marks append-only, creating and flagging the
+ * file on first use. Appends are all the kernel allows once the flag is set, which
+ * is exactly what an anchor sink needs. Throws on a platform where the flag cannot
+ * be set, rather than writing an unprotected file that would pass for a protected
+ * one — the caller decides whether to fall back to a plain anchor.
+ *
+ * Flagging an existing unflagged file trusts whatever it already holds; only its
+ * future is protected. To start from a clean sink, point this at a fresh path.
+ */
+export function writeAppendOnlyAnchor(path: string, a: Anchor): void {
+  const support = appendOnlySupport();
+  if (!support.supported) {
+    throw new Error(`append-only anchoring unavailable on ${support.platform}: ${support.reason}`);
+  }
+  mkdirSync(dirname(path), { recursive: true });
+  if (!existsSync(path)) {
+    closeSync(openSync(path, 'a')); // create empty; O_APPEND, no truncate
+  }
+  if (!isAppendOnly(path)) setAppendOnly(path);
+  // appendFileSync opens O_APPEND, the one write mode the flag permits.
+  appendFileSync(path, JSON.stringify(a) + '\n');
+}
