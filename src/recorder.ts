@@ -20,11 +20,13 @@ import {
   LEDGER_FILE,
   loadOrCreateKeys,
   publicKeyToBase64,
+  readLedger,
   seal,
   type Body,
   type Entry,
   type Payload,
 } from './ledger.ts';
+import { verifyLedger } from './verify.ts';
 
 export interface RecorderOptions {
   session?: string;
@@ -74,6 +76,59 @@ export class Recorder {
     const session = opts.session ?? randomUUID();
     const rec = new Recorder(dir, keys.privateKey, fd, session, opts);
     rec.append({ kind: 'open', session, pub: publicKeyToBase64(keys.publicKey), actor: opts.actor });
+    return rec;
+  }
+
+  /**
+   * Continue recording into an existing ledger after a recorder restart — the
+   * crash-recovery case. This is the one path that reopens a ledger, and it is
+   * deliberately narrow:
+   *
+   *   - The existing chain is verified against this recorder's own key first.
+   *     A tampered ledger, a wrong key, or a broken chain is refused, not
+   *     continued — resuming onto a corrupt base would launder it.
+   *   - A cleanly `close`d session is refused. Close is final; the verifier
+   *     treats anything after it as tampering, so there is nowhere sound to
+   *     append. To continue past a close, start a new session (a new file).
+   *   - The first thing written is a `resume` marker naming the head it
+   *     continues from, so the restart — and the recording gap around it — is
+   *     on the record rather than hidden by a seamless-looking chain.
+   *
+   * A call that was in flight when the recorder died stays unanswered, and
+   * `close` reports it as open: the outcome that happened in the gap was never
+   * seen, and the ledger says so rather than guessing.
+   */
+  static resume(dir: string, opts: RecorderOptions = {}): Recorder {
+    const ledgerPath = join(dir, LEDGER_FILE);
+    if (!existsSync(ledgerPath)) {
+      throw new Error(`no ledger at ${ledgerPath} to resume; use Recorder.open for a fresh session`);
+    }
+    const keys = opts.keys ?? loadOrCreateKeys(dir);
+    const { entries, problems } = readLedger(dir);
+    const verdict = verifyLedger(entries, { trustedKey: keys.publicKey, problems });
+    if (verdict.status === 'tampered') {
+      const keyMismatch = verdict.findings.some((f) => f.code === 'KEY_MISMATCH');
+      const detail = keyMismatch
+        ? 'the key here does not match the one that signed it — resume needs the original recorder key'
+        : verdict.findings.filter((f) => f.severity === 'tamper').map((f) => f.code).join(', ');
+      throw new Error(`refusing to resume a tampered ledger (${detail})`);
+    }
+    const last = entries[entries.length - 1];
+    if (last.kind === 'close') {
+      throw new Error('refusing to resume a closed session; close is final — start a new session instead');
+    }
+    const genesis = entries[0] as Extract<Entry, { kind: 'open' }>;
+    const fd = openSync(ledgerPath, 'a');
+    const rec = new Recorder(dir, keys.privateKey, fd, genesis.session, opts);
+    rec.seq = last.seq + 1;
+    rec.prev = last.hash;
+    rec.headHash = last.hash;
+    rec.lastTs = last.ts;
+    for (const e of entries) {
+      if (e.kind === 'call') rec.calls.add(e.id);
+      else if (e.kind === 'result') rec.answered.add(e.of);
+    }
+    rec.append({ kind: 'resume', from: last.seq, fromHash: last.hash, actor: opts.actor });
     return rec;
   }
 

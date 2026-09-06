@@ -60,6 +60,15 @@ export type Body = Base &
       }
     | { kind: 'note'; text: string }
     | {
+        kind: 'resume';
+        /** Seq of the entry this resume continues from — the head at restart. */
+        from: number;
+        /** Hash of that entry. Must equal this resume entry's own `prev`. */
+        fromHash: string;
+        /** Who took over recording after the restart (a new process, pid, host). */
+        actor?: string;
+      }
+    | {
         kind: 'close';
         calls: number;
         results: number;

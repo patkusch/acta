@@ -156,6 +156,15 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
         }
         break;
       }
+      case 'resume': {
+        // A resume marks a recorder restart. Its claimed origin must be the entry
+        // it actually chains onto — otherwise it is a fabricated continuity claim.
+        const priorSeq = i > 0 ? entries[i - 1].seq : -1;
+        if (entry.fromHash !== prevHash || entry.from !== priorSeq) {
+          add('RESUME_MISMATCH', 'tamper', `resume claims to continue from seq ${entry.from} (${entry.fromHash.slice(0, 12)}…) but the entry before it is seq ${priorSeq} (${prevHash.slice(0, 12)}…)`, i);
+        }
+        break;
+      }
       case 'close': {
         closedAt = i;
         if (entry.calls !== calls.size || entry.results !== answered.size) {

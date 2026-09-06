@@ -17,6 +17,8 @@ export function describe(e: Entry): string {
       return head + `${e.ok ? 'ok  ' : `${RED}fail${OFF}`} ${DIM}${e.body !== undefined ? JSON.stringify(e.body).slice(0, 100) : `${e.bytes} bytes ${e.digest.slice(0, 12)}…`}${OFF}`;
     case 'note':
       return head + `note ${e.text}`;
+    case 'resume':
+      return head + `${BOLD}resume${OFF} from seq ${e.from} ${DIM}${e.fromHash.slice(0, 12)}…${OFF}${e.actor ? ` (${e.actor})` : ''}`;
     case 'close':
       return head + `${BOLD}close${OFF} ${e.calls} calls, ${e.results} results${e.open.length ? `, ${e.open.length} still open` : ''}`;
   }
