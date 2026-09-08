@@ -47,7 +47,20 @@ export type Body = Base &
         /** Free-text label for who is being recorded (a host, a harness, a run id). */
         actor?: string;
       }
-    | { kind: 'call'; id: string; tool: string; args: unknown; actor?: string }
+    | {
+        kind: 'call';
+        id: string;
+        tool: string;
+        args: unknown;
+        actor?: string;
+        /**
+         * The definition this call was made against: the seq of the `tools/list`
+         * result that carried the catalogue the agent was shown, and the sha256 of
+         * this tool's definition in it. The verifier follows the reference and
+         * recomputes the digest, so the two cannot drift apart unnoticed.
+         */
+        def?: { seq: number; digest: string };
+      }
     | {
         kind: 'result';
         of: string;

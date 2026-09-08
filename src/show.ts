@@ -12,7 +12,7 @@ export function describe(e: Entry): string {
     case 'open':
       return head + `${BOLD}open${OFF} session ${e.session}${e.actor ? ` (${e.actor})` : ''} key ${fingerprint(publicKeyFromBase64(e.pub))}`;
     case 'call':
-      return head + `${BOLD}call${OFF} ${e.tool} ${DIM}${JSON.stringify(e.args).slice(0, 100)}${OFF}`;
+      return head + `${BOLD}call${OFF} ${e.tool} ${DIM}${JSON.stringify(e.args).slice(0, 100)}${e.def ? ` def@${e.def.seq}` : ''}${OFF}`;
     case 'result':
       return head + `${e.ok ? 'ok  ' : `${RED}fail${OFF}`} ${DIM}${e.body !== undefined ? JSON.stringify(e.body).slice(0, 100) : `${e.bytes} bytes ${e.digest.slice(0, 12)}…`}${OFF}`;
     case 'note':

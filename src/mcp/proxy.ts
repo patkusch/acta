@@ -9,12 +9,55 @@
  */
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
+import { digest } from '../canon.ts';
 import { Recorder, type RecorderOptions } from '../recorder.ts';
-import { LEDGER_FILE, generateKeys } from '../ledger.ts';
+import { BLOB_DIR, LEDGER_FILE, generateKeys, readLedger } from '../ledger.ts';
+
+/**
+ * The definitions in force: the seq of the ledger entry that recorded the
+ * catalogue, and each tool's definition digest taken from those same bytes.
+ */
+interface Catalogue {
+  seq: number;
+  tools: Map<string, string>;
+}
+
+function catalogueOf(seq: number, body: unknown): Catalogue | undefined {
+  const tools = (body as { tools?: unknown } | null)?.tools;
+  if (!Array.isArray(tools)) return undefined;
+  const map = new Map<string, string>();
+  for (const t of tools) {
+    if (t && typeof t === 'object' && typeof (t as { name?: unknown }).name === 'string') map.set((t as { name: string }).name, digest(t));
+  }
+  return { seq, tools: map };
+}
+
+/**
+ * After a restart the definitions in force are whatever the host last listed,
+ * and that is in the ledger being resumed. Read it back so calls made before
+ * the host lists again are still bound to what the agent was actually shown.
+ */
+function catalogueFromLedger(dir: string): Catalogue | undefined {
+  const { entries } = readLedger(dir);
+  const listings = new Set(entries.filter((e) => e.kind === 'call' && e.tool === 'tools/list').map((e) => (e as { id: string }).id));
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.kind !== 'result' || !listings.has(e.of) || !e.ok) continue;
+    let body = e.body;
+    if (body === undefined) {
+      const path = join(dir, BLOB_DIR, e.digest);
+      if (!existsSync(path)) continue;
+      body = JSON.parse(readFileSync(path, 'utf8'));
+    }
+    const found = catalogueOf(e.seq, body);
+    if (found) return found;
+  }
+  return undefined;
+}
 
 interface JsonRpc {
   jsonrpc: '2.0';
@@ -57,6 +100,10 @@ export function startProxy(command: string, args: string[], options: ProxyOption
   const runTag = randomUUID().slice(0, 8);
   /** JSON-RPC id → ledger call id, for requests we are waiting on. */
   const pending = new Map<string, string>();
+  /** Ledger call ids of `tools/list` requests, whose results are catalogues. */
+  const listings = new Set<string>();
+  /** The catalogue the agent was most recently shown. Every tools/call is bound to it. */
+  let catalogue: Catalogue | undefined = resuming ? catalogueFromLedger(options.dir) : undefined;
   /** Completed calls. Anchors are taken on completion, so a pipelined burst cannot double-anchor. */
   let completed = 0;
 
@@ -80,11 +127,20 @@ export function startProxy(command: string, args: string[], options: ProxyOption
       const callId = pending.get(String(message.id));
       if (callId) {
         pending.delete(String(message.id));
-        if (message.error) rec.result(callId, message.error, { ok: false });
-        else rec.result(callId, message.result ?? null, { ok: !isToolError(message.result) });
+        if (message.error) {
+          rec.result(callId, message.error, { ok: false });
+        } else {
+          const entry = rec.result(callId, message.result ?? null, { ok: !isToolError(message.result) });
+          // A fresh catalogue: from here on, calls are bound to this one.
+          if (listings.delete(callId)) catalogue = catalogueOf(entry.seq, message.result) ?? catalogue;
+        }
         completed += 1;
         maybeAnchor();
       }
+    } else if (message.method === 'notifications/tools/list_changed') {
+      // The server says its definitions changed. Calls stay bound to the last
+      // catalogue the host fetched, because that is still what the agent saw.
+      rec.note('tools/list_changed: the server says its definitions changed; calls stay bound to the last catalogue listed');
     }
     send(process.stdout, message);
   });
@@ -101,13 +157,17 @@ export function startProxy(command: string, args: string[], options: ProxyOption
     }
     if (message.method === 'tools/call' && message.id !== undefined) {
       const name = String(message.params?.name ?? '');
-      const callId = rec.call(name, message.params?.arguments ?? {}, { id: `rpc-${runTag}-${message.id}` });
+      // Bind the call to the definition the agent was shown. A tool the current
+      // catalogue does not list gets no binding, and the verifier says so.
+      const def = catalogue?.tools.has(name) ? { seq: catalogue.seq, digest: catalogue.tools.get(name)! } : undefined;
+      const callId = rec.call(name, message.params?.arguments ?? {}, { id: `rpc-${runTag}-${message.id}`, def });
       pending.set(String(message.id), callId);
     } else if (message.method === 'tools/list' && message.id !== undefined) {
       // The catalogue is recorded as a call so the definitions the agent was
       // shown sit in the same chain as the calls it made against them.
       const callId = rec.call('tools/list', message.params ?? {}, { id: `rpc-${runTag}-${message.id}` });
       pending.set(String(message.id), callId);
+      listings.add(callId);
     } else if (message.method === 'notifications/cancelled') {
       rec.note(`cancelled: ${JSON.stringify(message.params ?? {})}`);
     }

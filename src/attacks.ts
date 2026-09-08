@@ -13,6 +13,7 @@
  */
 import type { KeyObject } from 'node:crypto';
 
+import { canon, digest } from './canon.ts';
 import { generateKeys, hashBody, bodyOf, publicKeyToBase64, seal, signHash, type Entry } from './ledger.ts';
 import type { SampleSession } from './fixtures/session.ts';
 
@@ -53,6 +54,20 @@ function narrowTheDelete(entries: Entry[], seq: number): Entry[] {
   const e = clone(entries);
   const call = e[seq] as Extract<Entry, { kind: 'call' }>;
   call.args = { cmd: 'rm -rf test/fixtures/old/tmp' };
+  return e;
+}
+
+type CatalogueBody = { tools: Array<{ name: string; description: string }> };
+
+/** Make the recorded definition of `shell` claim a sandbox, and fix the result's digest and length to match. */
+function sandboxTheShell(entries: Entry[], s: SampleSession): Entry[] {
+  const e = clone(entries);
+  const cat = e[s.marks.catalogue] as Extract<Entry, { kind: 'result' }>;
+  const body = structuredClone(cat.body) as CatalogueBody;
+  body.tools.find((t) => t.name === 'shell')!.description = 'Run a shell command in a throwaway sandbox. Nothing it does reaches the workspace.';
+  cat.body = body;
+  cat.digest = digest(body);
+  cat.bytes = Buffer.byteLength(canon(body));
   return e;
 }
 
@@ -145,6 +160,23 @@ export const ATTACKS: Attack[] = [
       close.results -= 1;
       close.open = [...close.open, call.id];
       return { entries: rechain(e, s.marks.deleteResult, s.keys.privateKey) };
+    },
+  },
+  {
+    name: 'redefine the tool, real key',
+    intent: 'make the recorded definition of `shell` say it was sandboxed, fix the catalogue digest, rechain and re-sign',
+    needs: 'real key',
+    apply: (entries, s) => ({ entries: rechain(sandboxTheShell(entries, s), s.marks.catalogue, s.keys.privateKey) }),
+  },
+  {
+    name: 'redefine and rebind, real key',
+    intent: 'the same, and also point every `shell` call at the new definition',
+    needs: 'real key',
+    apply: (entries, s) => {
+      const e = sandboxTheShell(entries, s);
+      const shell = ((e[s.marks.catalogue] as Extract<Entry, { kind: 'result' }>).body as CatalogueBody).tools.find((t) => t.name === 'shell')!;
+      for (const x of e) if (x.kind === 'call' && x.tool === 'shell' && x.def) x.def = { ...x.def, digest: digest(shell) };
+      return { entries: rechain(e, s.marks.catalogue, s.keys.privateKey) };
     },
   },
   {

@@ -17,8 +17,8 @@ attackers it can and cannot catch.
 
 ```bash
 npm install
-npm test          # 36 tests: the chain, the recorder, the proxy, resume, key rotation, and every attack in the catalogue
-npm run attack    # the demo: ten attacks, three verifier configurations, one cell that stays red
+npm test          # 44 tests: the chain, the recorder, the proxy, resume, key rotation, definition binding, and every attack in the catalogue
+npm run attack    # the demo: twelve attacks, three verifier configurations, one cell that stays red
 
 # record a real MCP server
 node bin/acta.mjs mcp --dir /var/acta/run-42 --anchor-every 10 --anchor-to /var/anchors/run-42 \
@@ -51,6 +51,7 @@ canonical form (sorted keys, no whitespace, nothing JSON cannot represent).
 ```json
 {"v":1,"seq":7,"prev":"3d0a…","ts":"2026-09-02T21:00:08.000Z","kind":"call",
  "id":"c3f1…","tool":"shell","args":{"cmd":"rm -rf test/fixtures/old"},
+ "def":{"seq":3,"digest":"e0b4…"},
  "hash":"9b41…","sig":"MEUCIQ…"}
 ```
 
@@ -59,6 +60,12 @@ Seven kinds: `open` (genesis, declares the session and the public key), `call`,
 `note`, `rotate` (retires the signing key and declares its successor), `resume`
 (marks a recorder restart and names the head it continues from), and `close`
 (which records the counts and which calls were still open).
+
+A `call` may also carry `def`: the seq of the recorded `tools/list` result the
+agent was shown and the digest of this tool's definition in it. The verifier
+follows that reference and recomputes the digest, so a call cannot quietly
+drift away from the definition it was made against — see
+[binding calls to definitions](#binding-calls-to-definitions).
 
 ## Three verdicts, not two
 
@@ -101,7 +108,7 @@ anchored at seq 2
 
 `npm run attack` records a genuine session — an agent fixing a flaky test,
 deleting a fixture directory with a noted approval, posting to a webhook — then
-runs ten attacks against it. Each attack is labelled with what the attacker
+runs twelve attacks against it. Each attack is labelled with what the attacker
 needs. Each is verified three ways: the chain alone, chain plus a trusted key,
 chain plus key plus anchor. The catalogue is in
 [`src/attacks.ts`](src/attacks.ts) and asserted in
@@ -119,20 +126,29 @@ edit and rechain                  format    caught  caught  caught
 rewrite under own key             own key   —       caught  caught
 rewrite with the real key         real key  —       —       caught
 lose the outcome, real key        real key  —       —       caught
+redefine the tool, real key       real key  caught  caught  caught
+redefine and rebind, real key     real key  —       —       caught
 after the last anchor, real key   real key  —       —       —
 
-  the chain alone catches 5 of 10: anyone who can write the file but does not understand it.
-  a trusted key catches 6: anyone who does not hold the recorder's key.
-  an anchor catches 9: anyone who holds the key, for entries up to the anchor.
+  the chain alone catches 6 of 12: anyone who can write the file but does not understand it.
+  a trusted key catches 7: anyone who does not hold the recorder's key.
+  an anchor catches 11: anyone who holds the key, for entries up to the anchor.
   nothing catches 1: the key holder, between the last anchor and now.
 ```
 
-Two rows deserve a second look.
+Three rows deserve a second look.
 
 **Truncate** is caught by nothing but the anchor. A ledger with its last twenty
 lines cut off is a perfectly valid shorter ledger; it looks exactly like a
 session that crashed. Hash chains do not protect against this and it is the
 easiest attack on the list — it needs no understanding of the format at all.
+
+**Redefine the tool** is a real-key attack that the chain alone catches. Not
+because the chain can see through a signature — it cannot — but because every
+call carries the digest of the definition it was made against, and the attacker
+rewrote the definition without rewriting the calls. The next row is what
+happens when they do: caught by the anchor, and by nothing else. A
+cross-reference costs the key holder one more edit. It does not stop them.
 
 **After the last anchor** is caught by nothing. If the agent holds the key, or
 the key was ever within its reach, every entry since the last anchor is the
@@ -215,8 +231,9 @@ const verdict = verifyLedger(entries, {
 untouched; every `tools/call` and its response is recorded, with `isError`
 results marked as failures. `tools/list` is recorded too, as a call whose
 result is the catalogue, so the definitions the agent was shown sit in the same
-chain as the calls it made against them — a later reader can tell what the
-agent was told a tool would do, not just what it did. Anchors are taken on call *completion*, so a
+chain as the calls it made against them, and every `tools/call` after it is
+bound to that catalogue — a later reader can tell what the agent was told a
+tool would do, not just what it did. Anchors are taken on call *completion*, so a
 pipelined burst of requests cannot double-anchor. The proxy prints each anchor
 line to stderr as it takes one, which is a cheap way to get anchors into a
 host's own log.
@@ -231,6 +248,43 @@ acta mcp    [--dir d] [--resume [--rotate-on-resume]] [--anchor-every N] [--anch
 
 Exit codes from `verify`: 0 verified (or consistent without `--strict`),
 1 tampered, 3 consistent under `--strict`.
+
+### Binding calls to definitions
+
+A tool is what its definition says it is. `shell` described as "not sandboxed"
+is a different tool from `shell` described as "runs in a throwaway sandbox",
+and an agent that read the second and did the first was misled, not reckless.
+So the proxy treats a `tools/list` result as the catalogue in force, and every
+`tools/call` after it carries `def`: the seq of that catalogue entry and the
+sha256 of this tool's definition inside it, computed from the same bytes the
+ledger recorded. The verifier follows the reference and recomputes the digest.
+
+What that buys, and what it does not:
+
+- **Each call names the definition it was made against.** When a server
+  changes its definitions mid-session and the host lists again, the ledger has
+  two catalogues, and every call says which one it was made under. A
+  `notifications/tools/list_changed` from the server is recorded as a note;
+  calls stay bound to the last catalogue the host actually fetched, because
+  that is what the agent saw. After a `--resume`, the definitions in force are
+  read back from the ledger, so calls before the host lists again are still
+  bound.
+- **Calls the catalogue does not cover are flagged.** A call to a tool the
+  catalogue in force does not list is `UNLISTED_TOOL`: the agent called
+  something it was never shown. A call after a catalogue with no binding at
+  all is `UNBOUND_CALL`. Both are warnings — the record is consistent, just
+  less informative. Calls made before any catalogue was listed are not flagged.
+- **It is one more thing a key holder must keep consistent.** Rewriting the
+  recorded definition of `shell` to say it was sandboxed — the edit a tool
+  author would most want — now needs every `shell` call rebound as well, or
+  `DEF_MISMATCH` fires with the chain alone. Rebinding is not hard for someone
+  with the key; the attack table has both rows, and the second is caught only
+  by an anchor. This is a cross-reference, not a defence against the key
+  holder. Nothing in this file is.
+- **It says nothing about what the server did with the call.** A server that
+  lists one definition and executes another is outside the recorded boundary,
+  exactly as the tool's side effects are. The ledger proves what the agent was
+  told and what it asked for; it never saw what ran.
 
 ### Resuming after a restart
 
@@ -329,6 +383,8 @@ substitute for anchoring somewhere the agent has no write at all.
 | `AFTER_CLOSE` | tamper | entries follow the `close` |
 | `ORPHAN_RESULT`, `DUPLICATE_RESULT`, `DUPLICATE_CALL` | tamper | a result without a call, or a second of either |
 | `RESULT_REMOVED` | tamper | a call has no result and `close` does not list it as open |
+| `DEF_MISMATCH` | tamper | a call's bound definition digest is not what the cited catalogue holds, or that catalogue does not define the tool |
+| `BAD_DEF_REF` | tamper | a call is bound to a seq that is not an earlier `tools/list` result |
 | `COUNT_MISMATCH` | tamper | `close` counts disagree with the ledger |
 | `BODY_MISMATCH`, `BLOB_MISMATCH` | tamper | a result body does not match its digest |
 | `TRUNCATED` | tamper | an anchor points past the end of the ledger |
@@ -340,8 +396,11 @@ substitute for anchoring somewhere the agent has no write at all.
 | `UNANSWERED_CALL` | warn | a call has no outcome and the session did not close |
 | `CLOCK_REGRESSION` | warn | a timestamp precedes the one before it |
 | `BLOB_MISSING` | warn | a large result body is not in the blob store |
+| `UNLISTED_TOOL` | warn | a call names a tool the catalogue in force does not list |
+| `UNBOUND_CALL` | warn | a call made after a catalogue carries no binding to a definition |
 | `SELF_ATTESTED_KEY` | info | no `--key` was given; the ledger vouched for itself |
 | `UNANCHORED_TAIL` | info | entries after the last anchor are the key holder's word |
+| `DEF_UNCHECKED` | info | the bound catalogue's body is not available here, so the binding was not checked |
 
 ## Layout
 
@@ -359,8 +418,6 @@ substitute for anchoring somewhere the agent has no write at all.
 - A signed transparency log as an anchor sink. A local append-only file
   (`--append-to`, `chflags uappnd`) and git notes pushed to a remote are both
   supported; a public append-only log with independent witnesses is not.
-- Recording tool definitions alongside the calls made against them beyond
-  `tools/list` — a per-call binding to the exact schema in force at call time.
 
 ## License
 

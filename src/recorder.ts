@@ -145,17 +145,21 @@ export class Recorder {
     return { seq: this.seq - 1, hash: this.headHash };
   }
 
-  /** Record that a tool is about to be called. Returns the id a result must cite. */
-  call(tool: string, args: unknown, opts: { id?: string; actor?: string } = {}): string {
+  /**
+   * Record that a tool is about to be called. Returns the id a result must cite.
+   * `def` binds the call to the definition the agent was shown: the seq of a
+   * recorded `tools/list` result and the digest of this tool's entry in it.
+   */
+  call(tool: string, args: unknown, opts: { id?: string; actor?: string; def?: { seq: number; digest: string } } = {}): string {
     const id = opts.id ?? randomUUID();
     if (this.calls.has(id)) throw new Error(`call id ${id} already recorded`);
     this.calls.add(id);
-    this.append({ kind: 'call', id, tool, args, actor: opts.actor });
+    this.append({ kind: 'call', id, tool, args, actor: opts.actor, def: opts.def });
     return id;
   }
 
-  /** Record what came back. Large bodies are stored by digest in the blob store. */
-  result(of: string, body: unknown, opts: ResultOptions = {}): void {
+  /** Record what came back. Large bodies are stored by digest in the blob store. Returns the entry written. */
+  result(of: string, body: unknown, opts: ResultOptions = {}): Entry {
     if (!this.calls.has(of)) throw new Error(`result for unknown call ${of}`);
     if (this.answered.has(of)) throw new Error(`call ${of} already has a result`);
     this.answered.add(of);
@@ -163,13 +167,12 @@ export class Recorder {
     const digest = sha256(text);
     const bytes = Buffer.byteLength(text);
     if (bytes <= this.inlineLimit) {
-      this.append({ kind: 'result', of, ok: opts.ok ?? true, digest, bytes, body: body === undefined ? null : body });
-    } else {
-      const blobs = join(this.dir, BLOB_DIR);
-      mkdirSync(blobs, { recursive: true });
-      writeFileSync(join(blobs, digest), text);
-      this.append({ kind: 'result', of, ok: opts.ok ?? true, digest, bytes });
+      return this.append({ kind: 'result', of, ok: opts.ok ?? true, digest, bytes, body: body === undefined ? null : body });
     }
+    const blobs = join(this.dir, BLOB_DIR);
+    mkdirSync(blobs, { recursive: true });
+    writeFileSync(join(blobs, digest), text);
+    return this.append({ kind: 'result', of, ok: opts.ok ?? true, digest, bytes });
   }
 
   fail(of: string, error: unknown): void {

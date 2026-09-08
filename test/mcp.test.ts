@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
+import { digest } from '../src/canon.ts';
 import { readLedger, loadPublicKey, publicKeyFromBase64, PUB_FILE, type Entry } from '../src/ledger.ts';
 import { verifyLedger } from '../src/verify.ts';
 import { readAnchors } from '../src/anchor.ts';
@@ -36,36 +37,51 @@ test('the MCP proxy records every tools/call and its response, and anchors on sc
   send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'echo', arguments: { text: 'hi' } } });
   send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'explode', arguments: {} } });
   await waitFor(4);
+  // Once the catalogue has come back, a call is bound to it; `mutate` also makes
+  // the server announce that its definitions changed.
+  send({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'mutate', arguments: {} } });
+  await waitFor(6); // 5 responses + the list_changed notification
   proxy.stdin.end();
   await new Promise((resolve) => proxy.on('exit', resolve));
 
-  assert.deepEqual(responses.map((r) => r.id), [1, 2, 3, 4]);
+  assert.deepEqual(responses.map((r) => r.id), [1, 2, 3, 4, undefined, 5]);
   assert.deepEqual((responses[2].result as { content: { text: string }[] }).content[0].text, 'hi');
 
-  // The requests were pipelined, so the ledger shows three calls then three
-  // results — the order things actually happened in, not the order we'd draw.
+  // The first requests were pipelined, so the ledger shows three calls then
+  // three results — the order things actually happened in, not the order we'd draw.
   const { entries } = readLedger(dir);
   assert.deepEqual(
     entries.map((e) => e.kind),
-    ['open', 'note', 'call', 'call', 'call', 'result', 'result', 'result', 'close'],
+    ['open', 'note', 'call', 'call', 'call', 'result', 'result', 'result', 'call', 'note', 'result', 'close'],
   );
   const calls = entries.filter((e): e is Extract<Entry, { kind: 'call' }> => e.kind === 'call');
-  assert.deepEqual(calls.map((c) => c.tool), ['tools/list', 'echo', 'explode']);
+  assert.deepEqual(calls.map((c) => c.tool), ['tools/list', 'echo', 'explode', 'mutate']);
   assert.deepEqual(calls[1].args, { text: 'hi' });
   const results = entries.filter((e): e is Extract<Entry, { kind: 'result' }> => e.kind === 'result');
-  // Each result references its call by the ledger id; the last one (explode) failed.
+  // Each result references its call by the ledger id; explode failed.
   assert.deepEqual(results.map((r) => r.of), calls.map((c) => c.id));
-  assert.deepEqual(results.map((r) => r.ok), [true, true, false]);
+  assert.deepEqual(results.map((r) => r.ok), [true, true, false, true]);
   // The catalogue the agent was shown is in the chain, with the tool definitions verbatim.
   const catalogue = results[0].body as { tools: { name: string }[] };
-  assert.deepEqual(catalogue.tools.map((t) => t.name), ['echo', 'explode']);
+  assert.deepEqual(catalogue.tools.map((t) => t.name), ['echo', 'explode', 'mutate']);
+  // echo and explode were called before the catalogue came back, so they carry no
+  // binding; mutate was called after it and is bound to that exact definition.
+  assert.equal(calls[1].def, undefined);
+  assert.equal(calls[2].def, undefined);
+  assert.deepEqual(calls[3].def, { seq: results[0].seq, digest: digest(catalogue.tools[2]) });
+  // The server's list_changed is on the record.
+  const notes = entries.filter((e): e is Extract<Entry, { kind: 'note' }> => e.kind === 'note');
+  assert.ok(notes.some((n) => n.text.startsWith('tools/list_changed')), notes.map((n) => n.text).join('\n'));
 
   const anchors = readAnchors(anchorTo);
-  assert.equal(anchors.length, 1);
+  assert.equal(anchors.length, 2);
   assert.ok(stderr.some((l) => l.startsWith('acta-anchor ')), stderr.join('\n'));
 
   const v = verifyLedger(entries, { trustedKey: loadPublicKey(join(dir, PUB_FILE)), anchors });
   assert.equal(v.status, 'verified', JSON.stringify(v.findings));
+  // The two pipelined calls were made before any catalogue existed, so they are
+  // not flagged; nothing else is either.
+  assert.deepEqual(v.findings.filter((f) => f.severity !== 'info').map((f) => f.code), []);
 });
 
 test('the proxy resumes a crashed run in the same ledger, and the whole thing still verifies', async () => {
@@ -93,12 +109,13 @@ test('the proxy resumes a crashed run in the same ledger, and the whole thing st
       for (const m of calls) proxy.stdin!.write(JSON.stringify(m) + '\n');
     });
 
-  // First run: one call, then the recorder is killed mid-flight — no clean close.
+  // First run: list, one call, then the recorder is killed mid-flight — no clean close.
   await drive(
     [],
     [
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
-      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'echo', arguments: { text: 'first' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'echo', arguments: { text: 'first' } } },
     ],
     (proxy) => proxy.kill('SIGKILL'),
   );
@@ -122,6 +139,13 @@ test('the proxy resumes a crashed run in the same ledger, and the whole thing st
   assert.equal(kinds[kinds.length - 1], 'close', 'and the second run closed cleanly');
   const echoes = entries.filter((e): e is Extract<Entry, { kind: 'call' }> => e.kind === 'call' && e.tool === 'echo');
   assert.deepEqual(echoes.map((c) => (c.args as { text: string }).text), ['first', 'second'], 'both runs are in one ledger');
+  // The second run never listed the tools, but the definitions in force are the
+  // ones run one recorded, so its call is bound to that catalogue — read back
+  // from the ledger on resume, not guessed.
+  const listing = entries.find((e): e is Extract<Entry, { kind: 'call' }> => e.kind === 'call' && e.tool === 'tools/list')!;
+  const catalogue = entries.find((e): e is Extract<Entry, { kind: 'result' }> => e.kind === 'result' && e.of === listing.id)!;
+  assert.equal(echoes[1].def?.seq, catalogue.seq, 'the post-resume call is bound to the pre-crash catalogue');
+  assert.equal(echoes[1].def?.digest, digest((catalogue.body as { tools: unknown[] }).tools[0]));
 
   const v = verifyLedger(entries, { trustedKey: loadPublicKey(join(dir, PUB_FILE)) });
   assert.notEqual(v.status, 'tampered', JSON.stringify(v.findings));

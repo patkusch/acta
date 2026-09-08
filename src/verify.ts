@@ -122,6 +122,14 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
   let currentKey = key;
   const calls = new Map<string, number>();
   const answered = new Map<string, number>();
+  /** Tool name per call id, to recognise which results are catalogues. */
+  const callTools = new Map<string, string>();
+  /**
+   * Catalogues by the seq of the result that carried them: each tool's
+   * definition digest, or null when the body is not here to recompute from.
+   */
+  const catalogues = new Map<number, Map<string, string> | null>();
+  let lastCatalogue: number | undefined;
   let prevHash = GENESIS_PREV;
   let prevTs = '';
   let closedAt: number | undefined;
@@ -144,21 +152,63 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
     if (closedAt !== undefined) add('AFTER_CLOSE', 'tamper', `entry after close at seq ${closedAt}`, i);
 
     switch (entry.kind) {
-      case 'call':
+      case 'call': {
         if (calls.has(entry.id)) add('DUPLICATE_CALL', 'tamper', `call id ${entry.id} reused`, i);
         calls.set(entry.id, i);
+        callTools.set(entry.id, entry.tool);
+        if (entry.tool === 'tools/list') break;
+        // The binding is a cross-reference inside the ledger: the call names the
+        // catalogue it was made under and the digest of its tool's definition
+        // there. Follow it and recompute. A bound call whose catalogue disagrees
+        // is inconsistent whoever signed it.
+        if (entry.def) {
+          const cat = catalogues.get(entry.def.seq);
+          if (cat === undefined) {
+            add('BAD_DEF_REF', 'tamper', `call is bound to seq ${entry.def.seq}, which is not an earlier tools/list result`, i);
+          } else if (cat === null) {
+            add('DEF_UNCHECKED', 'info', `bound to the catalogue at seq ${entry.def.seq}, whose body is not available here; the binding was not checked`, i);
+          } else if (!cat.has(entry.tool)) {
+            add('DEF_MISMATCH', 'tamper', `bound to the catalogue at seq ${entry.def.seq}, which does not define ${entry.tool}`, i);
+          } else if (cat.get(entry.tool) !== entry.def.digest) {
+            add('DEF_MISMATCH', 'tamper', `the definition of ${entry.tool} in the catalogue at seq ${entry.def.seq} is not the one this call was bound to`, i);
+          }
+        } else if (lastCatalogue !== undefined) {
+          const cat = catalogues.get(lastCatalogue);
+          if (cat && !cat.has(entry.tool)) {
+            add('UNLISTED_TOOL', 'warn', `${entry.tool} is not in the catalogue in force (seq ${lastCatalogue}); the agent called a tool it was not shown`, i);
+          } else {
+            add('UNBOUND_CALL', 'warn', `made after a catalogue was recorded (seq ${lastCatalogue}) but not bound to a definition`, i);
+          }
+        }
         break;
+      }
       case 'result': {
         if (!calls.has(entry.of)) add('ORPHAN_RESULT', 'tamper', `result for unknown call ${entry.of}`, i);
         else if (answered.has(entry.of)) add('DUPLICATE_RESULT', 'tamper', `second result for call ${entry.of}`, i);
         answered.set(entry.of, i);
+        let body: unknown;
+        let bodyAvailable = false;
         if ('body' in entry && entry.body !== undefined) {
+          body = entry.body;
+          bodyAvailable = true;
           if (digest(entry.body) !== entry.digest) add('BODY_MISMATCH', 'tamper', 'inline result body does not match its digest', i);
           if (Buffer.byteLength(canon(entry.body)) !== entry.bytes) add('BODY_MISMATCH', 'tamper', 'inline result length does not match', i);
         } else if (opts.blob) {
           const blob = opts.blob(entry.digest);
           if (!blob) add('BLOB_MISSING', 'warn', `result body ${entry.digest.slice(0, 12)}… not found in blob store`, i);
           else if (sha256(blob) !== entry.digest) add('BLOB_MISMATCH', 'tamper', 'stored result body does not match its digest', i);
+          else {
+            try {
+              body = JSON.parse(blob.toString('utf8'));
+              bodyAvailable = true;
+            } catch {
+              // an unparseable blob already failed its digest, or will read as no body
+            }
+          }
+        }
+        if (callTools.get(entry.of) === 'tools/list' && entry.ok) {
+          catalogues.set(i, bodyAvailable ? toolDigests(body) : null);
+          lastCatalogue = i;
         }
         break;
       }
@@ -225,6 +275,17 @@ export function verifyLedger(entries: Entry[], opts: VerifyOptions = {}): Verdic
   }
 
   return conclude(session, { seq: head.seq, hash: head.hash }, anchoredTo);
+
+  /** Each tool's definition digest, from a `tools/list` result body; null if it is not a catalogue. */
+  function toolDigests(body: unknown): Map<string, string> | null {
+    const tools = (body as { tools?: unknown } | null)?.tools;
+    if (!Array.isArray(tools)) return null;
+    const map = new Map<string, string>();
+    for (const t of tools) {
+      if (t && typeof t === 'object' && typeof (t as { name?: unknown }).name === 'string') map.set((t as { name: string }).name, digest(t));
+    }
+    return map;
+  }
 
   function conclude(sess?: string, hd?: Verdict['head'], anch?: Verdict['anchoredTo']): Verdict {
     const tampered = findings.some((f) => f.severity === 'tamper');

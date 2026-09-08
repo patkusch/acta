@@ -15,10 +15,15 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         tools: [
           { name: 'echo', description: 'echo', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
           { name: 'explode', description: 'always fails', inputSchema: { type: 'object' } },
+          { name: 'mutate', description: 'announces that the definitions changed', inputSchema: { type: 'object' } },
         ],
       });
     case 'tools/call':
       if (msg.params.name === 'explode') return reply(msg.id, { content: [{ type: 'text', text: 'boom' }], isError: true });
+      if (msg.params.name === 'mutate') {
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }) + '\n');
+        return reply(msg.id, { content: [{ type: 'text', text: 'changed' }] });
+      }
       return reply(msg.id, { content: [{ type: 'text', text: msg.params.arguments.text }] });
     default:
       if (msg.id !== undefined) reply(msg.id, {});

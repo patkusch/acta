@@ -31,6 +31,8 @@ const EXPECTED: Record<string, { chain: string[]; key: string[]; anchor: string[
   'rewrite under own key': { chain: [], key: ['KEY_MISMATCH', 'BAD_SIGNATURE'], anchor: ['KEY_MISMATCH', 'BAD_SIGNATURE'] },
   'rewrite with the real key': { chain: [], key: [], anchor: ['ANCHOR_MISMATCH'] },
   'lose the outcome, real key': { chain: [], key: [], anchor: ['ANCHOR_MISMATCH'] },
+  'redefine the tool, real key': { chain: ['DEF_MISMATCH'], key: ['DEF_MISMATCH'], anchor: ['DEF_MISMATCH', 'ANCHOR_MISMATCH'] },
+  'redefine and rebind, real key': { chain: [], key: [], anchor: ['ANCHOR_MISMATCH'] },
   'after the last anchor, real key': { chain: [], key: [], anchor: [] },
 };
 
