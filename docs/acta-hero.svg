@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" width="920" height="470" viewBox="0 0 920 470" role="img" aria-label="An agent's logbook, one line edited by hand, and acta verify printing TAMPERED at entry 13">
+  <style>
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 15px; fill: #c9d1d9; }
+    .dim { fill: #7d8590; }
+    .red { fill: #ff7b72; }
+    .grn { fill: #3fb950; }
+    .yel { fill: #d29922; }
+    .b { font-weight: 700; }
+    .h { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 13px; letter-spacing: 1.5px; fill: #7d8590; font-weight: 600; }
+  </style>
+  <rect width="920" height="470" rx="12" fill="#0d1117"/>
+  <rect width="920" height="36" rx="12" fill="#161b22"/>
+  <rect y="24" width="920" height="12" fill="#161b22"/>
+  <circle cx="22" cy="18" r="6" fill="#ff5f56"/><circle cx="42" cy="18" r="6" fill="#ffbd2e"/><circle cx="62" cy="18" r="6" fill="#27c93f"/>
+  <text x="460" y="23" text-anchor="middle" class="h">RUN-42</text>
+
+  <text x="28" y="72" class="h">WHAT THE AGENT DID</text>
+  <text x="28" y="98" class="m"><tspan class="dim">  12</tspan> note operator approved: "yes, delete the old fixture directory"</text>
+  <text x="28" y="122" class="m"><tspan class="dim">  13</tspan> <tspan class="b">call</tspan> shell {"cmd":"rm -rf test/fixtures/old"}</text>
+
+  <text x="28" y="170" class="h">WHAT SOMEONE CHANGED IT TO</text>
+  <rect x="20" y="180" width="880" height="28" rx="4" fill="#3a1d1d"/>
+  <text x="28" y="199" class="m red">- {"cmd":"rm -rf test/fixtures/old"}</text>
+  <rect x="20" y="210" width="880" height="28" rx="4" fill="#15301d"/>
+  <text x="28" y="229" class="m grn">+ {"cmd":"rm -rf test/fixtures/old/tmp"}</text>
+
+  <text x="28" y="282" class="h">WHAT ACTA SAYS</text>
+  <text x="28" y="310" class="m"><tspan class="dim">$</tspan> acta verify run-42 --key safe/recorder.pub --anchors safe/anchors.jsonl</text>
+  <text x="28" y="336" class="m"><tspan class="red b">TAMPERED</tspan>  20 entries  head seq 19 3a5130d96ced…</text>
+  <text x="28" y="360" class="m dim">anchored at seq 16</text>
+  <text x="28" y="384" class="m">  <tspan class="red">tamper</tspan> HASH_MISMATCH      @13   entry bytes do not match their hash</text>
+  <text x="28" y="408" class="m">  <tspan class="dim">info  </tspan> UNANCHORED_TAIL    @17   3 entries after the last anchor are unanchored</text>
+
+  <text x="28" y="448" class="m yel">untouched, the same log reads VERIFIED. one edited line, and acta names it.</text>
+</svg>

@@ -1,8 +1,71 @@
+<div align="center">
+
 # Acta
 
+### A logbook the driver can write in but cannot tear pages out of
+
+**An AI agent deletes a folder. Then someone edits the log to say it deleted less.**
+**Acta reads the log back and names the line that was changed.**
+
+<br/>
+
+![Acta catching a hand-edited line in an agent's log](./docs/acta-hero.svg)
+
+**A real run.** The edited line, and what Acta printed about it.
+[See it happen](#the-thirty-second-version) · [Run it yourself](#run-it-yourself) · [What it cannot catch](#what-this-does-not-prove)
+
+<br/>
+
+[![License](https://img.shields.io/badge/License-MIT-1A1A1A?style=for-the-badge)](./LICENSE)
+[![Tests](https://img.shields.io/badge/tests-44-2ea043?style=for-the-badge)](./test)
+[![Attacks](https://img.shields.io/badge/attacks_tested-12-2ea043?style=for-the-badge)](#the-attack-table)
+[![Dependencies](https://img.shields.io/badge/runtime_dependencies-0-1A1A1A?style=for-the-badge)](./package.json)
 [![test](https://github.com/patkusch/acta/actions/workflows/test.yml/badge.svg)](https://github.com/patkusch/acta/actions/workflows/test.yml)
 
-**A tamper-evident record of what an agent actually did — and an honest account of what that record does not prove.**
+</div>
+
+---
+
+## The thirty-second version
+
+An AI agent is asked to fix a failing test. On the way, the operator lets it delete an old folder, and it does. Acta writes down each step as it happens:
+
+> **entry 12** — *note:* operator approved: "yes, delete the old fixture directory"
+> **entry 13** — *shell:* `rm -rf test/fixtures/old`
+
+Checked straight after the run, the log comes back clean:
+
+```
+$ acta verify run-42 --key safe/recorder.pub --anchors safe/anchors.jsonl
+VERIFIED  20 entries  head seq 19 3a5130d96ced…
+anchored at seq 16
+  info   UNANCHORED_TAIL    @17   3 entries after the last anchor are unanchored
+```
+
+Now someone opens the log file and changes entry 13, so the agent seems to have deleted only a small corner of that folder:
+
+```diff
+- {"cmd":"rm -rf test/fixtures/old"}
++ {"cmd":"rm -rf test/fixtures/old/tmp"}
+```
+
+The file still reads perfectly well. Check it again:
+
+```
+$ acta verify run-42 --key safe/recorder.pub --anchors safe/anchors.jsonl
+TAMPERED  20 entries  head seq 19 3a5130d96ced…
+anchored at seq 16
+  tamper HASH_MISMATCH      @13   entry bytes do not match their hash
+  info   UNANCHORED_TAIL    @17   3 entries after the last anchor are unanchored
+```
+
+**Acta says the log was changed, and points at entry 13.**
+
+That is the easiest trick in the book. Acta is tested against twelve ways of doctoring a log, up to someone who holds Acta's own signing key. With a copy of that key and a checkpoint kept somewhere the agent cannot reach, it catches eleven. The twelfth, changes made by the key holder since the last checkpoint, it cannot catch, and [says so](#what-this-does-not-prove).
+
+---
+
+## What it is
 
 An agent runs for an hour and takes two hundred actions. Afterwards someone asks
 what happened. The usual answer is a log written by the same process that took
@@ -14,6 +77,8 @@ result goes into an append-only ledger where each entry commits to the one
 before it and is signed by a key the agent must not hold. The verifier tells
 you whether the ledger has been touched — and, more usefully, exactly which
 attackers it can and cannot catch.
+
+## Run it yourself
 
 ```bash
 npm install
@@ -30,6 +95,8 @@ node bin/acta.mjs verify /var/acta/run-42 --key /var/anchors/recorder.pub --anch
 ```
 
 No runtime dependencies. Node 22.6 or later (it runs TypeScript directly).
+
+The story above is the first row of the attack table, `edit in place`, run by hand through the CLI.
 
 ---
 
