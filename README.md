@@ -17,7 +17,7 @@
 <br/>
 
 [![License](https://img.shields.io/badge/License-MIT-1A1A1A?style=for-the-badge)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-44-2ea043?style=for-the-badge)](./test)
+[![Tests](https://img.shields.io/badge/tests-53-2ea043?style=for-the-badge)](./test)
 [![Attacks](https://img.shields.io/badge/attacks_tested-12-2ea043?style=for-the-badge)](#the-attack-table)
 [![Dependencies](https://img.shields.io/badge/runtime_dependencies-0-1A1A1A?style=for-the-badge)](./package.json)
 [![test](https://github.com/patkusch/acta/actions/workflows/test.yml/badge.svg)](https://github.com/patkusch/acta/actions/workflows/test.yml)
@@ -82,7 +82,7 @@ attackers it can and cannot catch.
 
 ```bash
 npm install
-npm test          # 44 tests: the chain, the recorder, the proxy, resume, key rotation, definition binding, and every attack in the catalogue
+npm test          # 53 tests: the chain, the recorder, the proxy, resume, key rotation, definition binding, the GitHub witness sink, and every attack in the catalogue
 npm run attack    # the demo: twelve attacks, three verifier configurations, one cell that stays red
 
 # record a real MCP server
@@ -307,8 +307,8 @@ host's own log.
 
 ```
 acta init   [dir]                                   create a ledger directory and key pair
-acta verify [dir] [--key pem] [--anchors file] [--strict] [--json]
-acta anchor [dir] [--to file] [--append-to file]    write the current head as an anchor
+acta verify [dir] [--key pem] [--anchors file] [--git] [--witness file] [--strict] [--json]
+acta anchor [dir] [--to file] [--append-to file] [--git] [--github owner/name[:branch] [--github-path file] [--witness-out file]]
 acta show   [dir]                                   print the timeline
 acta mcp    [--dir d] [--resume [--rotate-on-resume]] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]
 ```
@@ -437,6 +437,73 @@ flag (`schg`, root and a reboot to clear). On Linux — where the equivalent is
 writing a file that only looks protected. This is a higher local bar, not a
 substitute for anchoring somewhere the agent has no write at all.
 
+### A public anchor witness
+
+Everything above is local: a file, a git ref, this machine's kernel. `acta
+anchor <dir> --github owner/name[:branch]` (and, in the library,
+`writeGitHubAnchor`) puts the anchor somewhere genuinely outside the machine —
+a public GitHub repository — and hands back a **witness**: the repository,
+branch, file, the exact commit SHA the anchor landed in, the commit's
+timestamp, and which line of the file it is. `acta verify --witness
+witness.json` does not trust that record. It re-fetches the commit and the
+file **from GitHub, by that commit's SHA**, and confirms the anchor is really
+there before letting it count towards the verdict.
+
+**What this proves.** A commit has a SHA computed from its own content and
+its parent, and GitHub stamps it with a timestamp of its own. Neither is
+something the party writing the anchor gets to choose after the fact. Once
+`verify --witness` has independently confirmed a commit exists with that SHA
+and that anchor inside it, two things follow: the anchor existed by that
+time, and it was written where changing it later means changing history that
+other people can already see. That is what a transparency log is fundamentally
+for — an existence proof, and a record that is hard to quietly rewrite — even
+without a dedicated transparency-log protocol underneath it.
+
+**What this does not prove, plainly.** GitHub — or anyone with push rights to
+that repository, which for `patkusch/acta-anchors` is `patkusch` alone — can
+force-push the branch and discard the commit the witness points at. Unlike
+the append-only file sink, nothing here stops that at the moment it happens.
+The one thing standing between a force-push and it working is: is the
+discarded commit still fetchable by its SHA? GitHub keeps orphaned commits
+reachable for a while (dangling-commit garbage collection is not immediate),
+but nothing here guarantees how long, and it is not a promise this project can
+make on GitHub's behalf.
+
+**What actually defends against it:** keep your own copy of the witness
+records — the same one `verify --witness` reads — somewhere the party who
+could force-push does not control. It is a few hundred bytes of JSON per
+anchor. With that copy in hand, a reviewer does not need the commit to still
+be fetchable at all: a force-push that discarded it is itself the finding —
+`gh api repos/<repo>/commits/<sha>` returning "no commit found" for a SHA your
+own kept record says was pushed **is** the tamper signal, exactly as a
+`chflags nouappnd` on the local sink would be if you had checked the flag
+beforehand. This is the same discipline every anchor sink in this project
+already asks for — an anchor is only as strong as a copy kept somewhere the
+attacker cannot reach — applied to the one sink here that is public.
+
+**Why not a real transparency log (Sigstore Rekor).** Rekor's `hashedrekord`
+entry needs an Ed25519**ph** signature — the pre-hashed variant of Ed25519,
+RFC 8032 §5.1.6 — and Node's `node:crypto` only signs plain Ed25519; the
+pre-hash mode is not exposed. Rekor's `rekord` entry type avoids that by
+taking the artifact itself rather than a pre-hash, which Node can sign today,
+but it depends on the v1 public instance, which is mid-migration. Neither is
+buildable on solid ground right now. A GitHub commit sidesteps the blocker
+entirely rather than waiting on it, at the cost of a weaker, centrally-run
+witness instead of a dedicated transparency-log network with independent
+operators and inclusion proofs. `writeGitHubAnchor` implements the same
+`AnchorSink` interface a Rekor sink would, so swapping one in later — once the
+signature gap closes, or using a language binding that can produce Ed25519ph
+— does not touch the recorder or the verifier.
+
+```ts
+import { writeGitHubAnchor, verifyGitHubWitness } from './src/github-anchor.ts';
+
+const witness = writeGitHubAnchor(anchor, { repo: 'patkusch/acta-anchors' });
+// { provider: 'github', repo, branch, path, commitSha, committedAt, line, anchor }
+
+verifyGitHubWitness(witness).ok  // re-fetches by commitSha; does not trust the record alone
+```
+
 ## Findings reference
 
 | code | severity | meaning |
@@ -469,6 +536,16 @@ substitute for anchoring somewhere the agent has no write at all.
 | `UNANCHORED_TAIL` | info | entries after the last anchor are the key holder's word |
 | `DEF_UNCHECKED` | info | the bound catalogue's body is not available here, so the binding was not checked |
 
+`verify --witness` runs one more check, outside `verifyLedger` (it needs the
+network; the rest of this table does not): `WITNESS_COMMIT_NOT_FOUND` the
+commit is not fetchable by that SHA, `WITNESS_FILE_NOT_FOUND` the file is not
+readable at that commit, `WITNESS_CONTENT_MISMATCH` the line at that commit is
+not the anchor claimed, `WITNESS_LINE_MISSING` the file at that commit is
+shorter than the claimed line, `WITNESS_TIMESTAMP_MISMATCH` GitHub's own
+commit timestamp does not match the one recorded — all tamper. A failed
+witness check is reported and fails `verify` on its own, whatever the
+ledger's own verdict says.
+
 ## Layout
 
 ```
@@ -482,9 +559,11 @@ substitute for anchoring somewhere the agent has no write at all.
 
 ## Not built
 
-- A signed transparency log as an anchor sink. A local append-only file
-  (`--append-to`, `chflags uappnd`) and git notes pushed to a remote are both
-  supported; a public append-only log with independent witnesses is not.
+- **A dedicated transparency-log network** (Sigstore Rekor or similar), with
+  independent operators and cryptographic inclusion proofs. [A public GitHub
+  commit is a real, checkable witness](#a-public-anchor-witness) — but it is
+  one party's server, not a network, and it is honest about that gap in the
+  section linked above.
 
 ## License
 
