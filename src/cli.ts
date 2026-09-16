@@ -5,10 +5,11 @@
  * acta show   [dir]                          print the timeline
  * acta mcp    [--dir d] [--resume [--rotate-on-resume]] [--anchor-every n] [--anchor-to file | --anchor-append-to file] -- <command...>
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import { readAnchors, formatAnchor, writeAnchor, writeGitAnchor, readGitAnchors, writeAppendOnlyAnchor, appendOnlySupport } from './anchor.ts';
+import { writeGitHubAnchor, verifyGitHubWitness, parseRepoSpec, type GitHubWitness } from './github-anchor.ts';
 import { BLOB_DIR, PUB_FILE, loadOrCreateKeys, loadPublicKey, readLedger, fingerprint, type Entry } from './ledger.ts';
 import { verifyLedger, type Verdict } from './verify.ts';
 import { startProxy } from './mcp/proxy.ts';
@@ -45,8 +46,8 @@ function usage(code: number): never {
     [
       'usage:',
       '  acta init   [dir]',
-      '  acta verify [dir] [--key recorder.pub] [--anchors anchors.jsonl] [--git [--repo path]] [--strict] [--json]',
-      '  acta anchor [dir] [--to anchors.jsonl] [--append-to anchors.jsonl] [--git [--repo path]]',
+      '  acta verify [dir] [--key recorder.pub] [--anchors anchors.jsonl] [--git [--repo path]] [--witness witness.json] [--strict] [--json]',
+      '  acta anchor [dir] [--to anchors.jsonl] [--append-to anchors.jsonl] [--git [--repo path]] [--github owner/name[:branch] [--github-path file] [--witness-out file]]',
       '  acta show   [dir]',
       '  acta mcp    [--dir .acta] [--resume [--rotate-on-resume]] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]',
     ].join('\n'),
@@ -74,25 +75,40 @@ switch (command) {
     const { entries, problems } = readLedger(dir);
     const keyPath = flag('--key');
     const anchorsPath = flag('--anchors');
+    const witnessPath = flag('--witness');
+
+    // A witness is not trusted just because the file says so: it is re-fetched
+    // from GitHub by commit SHA and checked against the anchor it claims before
+    // that anchor is allowed to count towards the verdict at all.
+    let witness: GitHubWitness | undefined;
+    let witnessCheck: { ok: boolean; findings: { code: string; severity: string; message: string }[] } | undefined;
+    if (witnessPath) {
+      witness = JSON.parse(readFileSync(resolve(witnessPath), 'utf8')) as GitHubWitness;
+      witnessCheck = verifyGitHubWitness(witness);
+    }
+
     const anchors = [
       ...(anchorsPath ? readAnchors(anchorsPath) : []),
       ...(has('--git') ? readGitAnchors({ cwd: flag('--repo') }) : []),
+      ...(witness && witnessCheck?.ok ? [witness.anchor] : []),
     ];
     const verdict = verifyLedger(entries, {
       problems,
       trustedKey: keyPath ? loadPublicKey(keyPath) : undefined,
-      anchors: anchorsPath || has('--git') ? anchors : undefined,
+      anchors: anchorsPath || has('--git') || witness ? anchors : undefined,
       blob: (digest) => {
         const p = join(dir, BLOB_DIR, digest);
         return existsSync(p) ? readFileSync(p) : undefined;
       },
     });
     if (has('--json')) {
-      console.log(JSON.stringify(verdict, null, 2));
+      console.log(JSON.stringify({ ...verdict, witness: witnessCheck }, null, 2));
     } else {
       printVerdict(verdict);
+      if (witnessCheck) printWitnessCheck(witness!, witnessCheck);
     }
-    process.exit(verdict.status === 'tampered' ? 1 : verdict.status === 'consistent' && has('--strict') ? 3 : 0);
+    const witnessFailed = witnessCheck !== undefined && !witnessCheck.ok;
+    process.exit(verdict.status === 'tampered' || witnessFailed ? 1 : verdict.status === 'consistent' && has('--strict') ? 3 : 0);
   }
 
   case 'anchor': {
@@ -118,6 +134,19 @@ switch (command) {
       writeAppendOnlyAnchor(resolve(appendTo), anchor);
     }
     if (has('--git')) writeGitAnchor(anchor, { cwd: flag('--repo') });
+    const github = flag('--github');
+    if (github) {
+      const { repo, branch } = parseRepoSpec(github);
+      const witness = writeGitHubAnchor(anchor, { repo, branch, path: flag('--github-path') });
+      console.log(`${DIM}pushed to ${witness.repo}@${witness.branch} as ${witness.commitSha.slice(0, 12)} (${witness.committedAt})${OFF}`);
+      const witnessOut = flag('--witness-out');
+      if (witnessOut) {
+        writeFileSync(resolve(witnessOut), JSON.stringify(witness, null, 2) + '\n');
+        console.log(`${DIM}witness written to ${witnessOut} — keep a copy of this outside the repo it points at; that copy is what makes a later force-push detectable.${OFF}`);
+      } else {
+        console.log(JSON.stringify(witness));
+      }
+    }
     console.log(formatAnchor(anchor));
     break;
   }
@@ -172,5 +201,14 @@ function printVerdict(v: Verdict) {
   if (v.status === 'consistent') {
     console.log(`${YELLOW}consistent is not verified.${OFF} still missing:`);
     for (const m of v.missing) console.log(`  - ${m}`);
+  }
+}
+
+function printWitnessCheck(w: GitHubWitness, check: { ok: boolean; findings: { code: string; severity: string; message: string }[] }) {
+  const label = check.ok ? `${GREEN}WITNESSED${OFF}` : `${RED}WITNESS FAILED${OFF}`;
+  console.log(`${label}  ${w.repo}@${w.commitSha.slice(0, 12)}  ${w.path}:${w.line}`);
+  for (const f of check.findings) {
+    const c = f.severity === 'tamper' ? RED : f.severity === 'warn' ? YELLOW : DIM;
+    console.log(`  ${c}${String(f.severity).padEnd(6)}${OFF} ${f.code.padEnd(24)} ${f.message}`);
   }
 }

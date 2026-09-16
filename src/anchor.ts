@@ -19,6 +19,23 @@ export interface Anchor {
   at: string;
 }
 
+/**
+ * A pluggable place to put an anchor. `write` returns a witness record when
+ * the sink can produce one a verifier can check independently of the local
+ * copy — a commit SHA, a transparency-log inclusion proof, anything with its
+ * own address that a tamper check can go fetch on its own and compare. Sinks
+ * that cannot (a local file, `chflags uappnd`, a git note not yet pushed)
+ * return undefined; there is nothing further to check than the file itself.
+ *
+ * `src/github-anchor.ts` is the first sink that returns a witness. It is the
+ * seam a stronger sink — a real Sigstore Rekor entry, once Node's Ed25519
+ * (not Ed25519ph) stops being a blocker — plugs into without the recorder or
+ * verifier changing.
+ */
+export interface AnchorSink<Witness = unknown> {
+  write(anchor: Anchor): Witness;
+}
+
 /** One line, fit for a commit message or a chat. Parses back with `parseAnchorLine`. */
 export function formatAnchor(a: Anchor): string {
   return `acta-anchor session=${a.session} seq=${a.seq} hash=${a.hash} at=${a.at}`;
