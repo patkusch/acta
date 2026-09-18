@@ -17,7 +17,7 @@
 <br/>
 
 [![License](https://img.shields.io/badge/License-MIT-1A1A1A?style=for-the-badge)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-53-2ea043?style=for-the-badge)](./test)
+[![Tests](https://img.shields.io/badge/tests-78-2ea043?style=for-the-badge)](./test)
 [![Attacks](https://img.shields.io/badge/attacks_tested-12-2ea043?style=for-the-badge)](#the-attack-table)
 [![Dependencies](https://img.shields.io/badge/runtime_dependencies-0-1A1A1A?style=for-the-badge)](./package.json)
 [![test](https://github.com/patkusch/acta/actions/workflows/test.yml/badge.svg)](https://github.com/patkusch/acta/actions/workflows/test.yml)
@@ -82,7 +82,7 @@ attackers it can and cannot catch.
 
 ```bash
 npm install
-npm test          # 53 tests: the chain, the recorder, the proxy, resume, key rotation, definition binding, the GitHub witness sink, and every attack in the catalogue
+npm test          # 78 tests: the chain, the recorder, the proxy, resume, key rotation, definition binding, the GitHub witness sink and its ledger, and every attack in the catalogue
 npm run attack    # the demo: twelve attacks, three verifier configurations, one cell that stays red
 
 # record a real MCP server
@@ -308,13 +308,18 @@ host's own log.
 ```
 acta init   [dir]                                   create a ledger directory and key pair
 acta verify [dir] [--key pem] [--anchors file] [--git] [--witness file] [--strict] [--json]
-acta anchor [dir] [--to file] [--append-to file] [--git] [--github owner/name[:branch] [--github-path file] [--witness-out file]]
+acta anchor [dir] [--to file] [--append-to file] [--git] [--github owner/name[:branch] [--github-path file] [--witness-out file] [--witness-ledger file]]
+acta witness backup [witnesses.jsonl | dir] --to <path | owner/name[:branch]> [--backup-path file]
+acta witness add witness.json [--ledger file]        file an older witness.json once GitHub confirms it
+acta verify --witnesses witnesses.jsonl [--json]     check every recorded witness against GitHub
 acta show   [dir]                                   print the timeline
 acta mcp    [--dir d] [--resume [--rotate-on-resume]] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]
 ```
 
 Exit codes from `verify`: 0 verified (or consistent without `--strict`),
-1 tampered, 3 consistent under `--strict`.
+1 tampered, 3 consistent under `--strict`. `verify --witnesses` uses 0 clean,
+1 tampered, 2 GitHub could not be reached (not a finding), 3 the ledger is
+empty.
 
 ### Binding calls to definitions
 
@@ -444,7 +449,8 @@ anchor <dir> --github owner/name[:branch]` (and, in the library,
 `writeGitHubAnchor`) puts the anchor somewhere genuinely outside the machine —
 a public GitHub repository — and hands back a **witness**: the repository,
 branch, file, the exact commit SHA the anchor landed in, the commit's
-timestamp, and which line of the file it is. `acta verify --witness
+timestamp, and which line of the file it is — and files a copy of it in a
+local [witness ledger](#the-witness-ledger). `acta verify --witness
 witness.json` does not trust that record. It re-fetches the commit and the
 file **from GitHub, by that commit's SHA**, and confirms the anchor is really
 there before letting it count towards the verdict.
@@ -469,17 +475,101 @@ reachable for a while (dangling-commit garbage collection is not immediate),
 but nothing here guarantees how long, and it is not a promise this project can
 make on GitHub's behalf.
 
-**What actually defends against it:** keep your own copy of the witness
-records — the same one `verify --witness` reads — somewhere the party who
-could force-push does not control. It is a few hundred bytes of JSON per
-anchor. With that copy in hand, a reviewer does not need the commit to still
-be fetchable at all: a force-push that discarded it is itself the finding —
-`gh api repos/<repo>/commits/<sha>` returning "no commit found" for a SHA your
-own kept record says was pushed **is** the tamper signal, exactly as a
-`chflags nouappnd` on the local sink would be if you had checked the flag
-beforehand. This is the same discipline every anchor sink in this project
-already asks for — an anchor is only as strong as a copy kept somewhere the
-attacker cannot reach — applied to the one sink here that is public.
+**What actually defends against it** is a copy of the witness records kept
+where the person who could force-push cannot reach. That used to be advice.
+It is now a feature, described next.
+
+#### The witness ledger
+
+Every `acta anchor --github` also writes its witness, as one line, into
+`witnesses.jsonl` — next to your anchors file, or wherever `--witness-ledger`
+points. The line holds the repository, branch, file, commit SHA, commit
+timestamp, line number, and the anchor itself (which carries the session id and
+the ledger-head digest). The file only ever grows. acta refuses to add to a
+damaged one, checks after each write that the earlier bytes are still there,
+and stops *before* pushing anything if the ledger is not in a state to be
+written to.
+
+```
+acta witness backup .acta --to /Volumes/usb/witnesses.jsonl   # a folder you control
+acta witness backup .acta --to yourname/acta-witness-backup   # or a second GitHub repo
+acta verify --witnesses .acta/witnesses.jsonl                 # ask GitHub about every record
+```
+
+**`backup`** copies the ledger to a second place: a local path (a USB stick, a
+synced folder) or a second GitHub repository, written through the same code the
+anchor sink uses. Run it twice and the second run does nothing. Run it after
+more anchors and it adds only the new lines. It will not overwrite a backup that
+holds a line the ledger does not have, or that disagrees with the ledger on a
+line both have. That is the tamper signal running the other way: it means the
+ledger was cut short or rewritten after the backup was made, or something else
+wrote to the backup. Nothing is overwritten and the command exits 1. (A bare
+`owner/name` is read as a GitHub repository unless it is, or sits in, a path
+that exists; write `./` or `github:` to be certain. A GitHub backup is as
+public as its repository, and the ledger holds your session ids.)
+
+**`verify --witnesses`** asks GitHub about every record, by commit SHA, and
+prints one line each:
+
+| result | what it means | exit |
+|:--|:--|:--|
+| `OK` | the commit is there, with that timestamp, holding that anchor on that line, and the branch head still begins with the log exactly as that commit saw it | 0 |
+| `WITNESS_REWRITTEN` | your ledger says this commit was pushed; GitHub can no longer produce it. It existed, so it was discarded — a force-push or a replaced repository | 1 |
+| `LOG_PREFIX_CHANGED` | the branch head no longer begins with the earlier lines in order: one was changed or removed, or the file is gone. This catches a rewrite even while the old commit can still be fetched | 1 |
+| `WITNESS_UNREACHABLE` | GitHub did not answer (no network, rate limit, expired login). Not a finding either way, and never counted as a pass | 2 |
+
+Other findings from the single-witness check (`WITNESS_CONTENT_MISMATCH` and
+the rest, see the findings reference) also print, and a line in the ledger that
+cannot be read is `WITNESS_LEDGER_MALFORMED`, also tamper. One rewritten record
+is not diluted by another record that could not be reached: tamper wins the
+summary. The check works the same on a backup, so a backup on its own is enough
+to convict.
+
+**What this proves.** The reason a force-push used to work is that "commit not
+found" reads like a typo. With your own record saying the commit was there, it
+reads as what it is. And because the head is compared with what each commit
+saw, a rewrite is caught even in the days before GitHub cleans up the old
+commit.
+
+**What this still cannot do.**
+
+- **A rewrite before the first backup is undetectable.** Until a copy exists
+  somewhere the rewriter cannot reach, the ledger and the repository are two
+  things one person with your machine and your GitHub login can change
+  together. `acta anchor --github` says so each time it files a witness.
+- **A backup is only as far away as you put it.** A folder on the same disk, or
+  a second repository the same login can force-push, is a copy the same person
+  can rewrite. A USB stick or a synced folder the agent's account cannot
+  write is the stronger choice.
+- **An anchor that was pushed but never filed is not in the ledger.** If the
+  process dies between the push and the write (or the ledger refuses the write),
+  there is no record to hold GitHub to. acta prints the witness so it can be
+  filed with `witness add`; a kill leaves nothing.
+- **"Not found" from a private repository can also mean "your login cannot see
+  it."** The wrong `gh` account reads as `WITNESS_REWRITTEN`. A witness
+  repository should be public, and this is one more reason.
+- **GitHub itself is still one party.** A GitHub that answered the same wrong
+  thing to every request would fool this. That is the gap a real transparency-log
+  network closes, and this does not.
+
+The real run, on 2026-09-18, against the two witnesses already pushed to
+[`patkusch/acta-anchors`](https://github.com/patkusch/acta-anchors) — the
+ledger rebuilt from GitHub's own API, nothing typed in by hand:
+
+```
+$ acta verify --witnesses witnesses.jsonl
+OK   bf3d0fec8689  patkusch/acta-anchors@main anchors.jsonl:0  seq 3  3e762b44  2026-09-16T21:00:38Z
+OK   787a9bd58a43  patkusch/acta-anchors@main anchors.jsonl:1  seq 3  3e762b44  2026-09-16T21:01:00Z
+CLEAN  2 records in witnesses.jsonl, every one still on GitHub, and no log has lost a line it had.
+```
+
+The tamper cases are not shown against that repository, because proving them
+for real would mean force-pushing it. They live in
+[`test/witness-ledger.test.ts`](test/witness-ledger.test.ts), against a fake
+GitHub, including the command line end to end. The one live probe run was
+read-only: a copy of the ledger with one digit of a SHA changed came back
+`WITNESS_REWRITTEN`, exit 1, and with the network cut it came back
+`WITNESS_UNREACHABLE`, exit 2.
 
 **Why not a real transparency log (Sigstore Rekor).** Rekor's `hashedrekord`
 entry needs an Ed25519**ph** signature — the pre-hashed variant of Ed25519,
@@ -497,11 +587,17 @@ signature gap closes, or using a language binding that can produce Ed25519ph
 
 ```ts
 import { writeGitHubAnchor, verifyGitHubWitness } from './src/github-anchor.ts';
+import { appendWitness, backupWitnessLedger, parseBackupTarget, verifyWitnessLedger } from './src/witness-ledger.ts';
 
 const witness = writeGitHubAnchor(anchor, { repo: 'patkusch/acta-anchors' });
 // { provider: 'github', repo, branch, path, commitSha, committedAt, line, anchor }
 
 verifyGitHubWitness(witness).ok  // re-fetches by commitSha; does not trust the record alone
+
+// and, from src/witness-ledger.ts: file it, back it up, check the lot
+appendWitness('witnesses.jsonl', witness);
+backupWitnessLedger('witnesses.jsonl', parseBackupTarget('/Volumes/usb/witnesses.jsonl'));
+verifyWitnessLedger('witnesses.jsonl').verdict  // 'clean' | 'tampered' | 'unreachable' | 'empty'
 ```
 
 ## Findings reference
@@ -542,9 +638,13 @@ commit is not fetchable by that SHA, `WITNESS_FILE_NOT_FOUND` the file is not
 readable at that commit, `WITNESS_CONTENT_MISMATCH` the line at that commit is
 not the anchor claimed, `WITNESS_LINE_MISSING` the file at that commit is
 shorter than the claimed line, `WITNESS_TIMESTAMP_MISMATCH` GitHub's own
-commit timestamp does not match the one recorded — all tamper. A failed
-witness check is reported and fails `verify` on its own, whatever the
-ledger's own verdict says.
+commit timestamp does not match the one recorded — all tamper. In a witness
+ledger, `WITNESS_COMMIT_NOT_FOUND` is reported as `WITNESS_REWRITTEN` (the ledger
+proves the commit existed) and `LOG_PREFIX_CHANGED` is added (see [the witness
+ledger](#the-witness-ledger)). A check that could not get an answer from GitHub
+at all is `WITNESS_UNREACHABLE`, a warning, and never a pass: single-witness
+`verify` exits 2 for it. A failed witness check is reported and fails `verify`
+on its own, whatever the ledger's own verdict says.
 
 ## Layout
 
@@ -555,6 +655,7 @@ ledger's own verdict says.
   recorder.pub      the public key; copy it somewhere else and verify against the copy
   blobs/<digest>    result bodies too large to inline
   anchors.jsonl     the default anchor file, which is the weakest place to put one
+  witnesses.jsonl   the witness ledger, written by `acta anchor --github` (or beside --to's file)
 ```
 
 ## Not built
