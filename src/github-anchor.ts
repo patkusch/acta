@@ -29,10 +29,11 @@
  * force-push that moves the branch does not by itself hide the commit — the
  * commit is still fetchable until it is actually GC'd. The honest remaining
  * gap: nothing stops the GC. The only real defence is the one this module
- * cannot provide from inside itself — keep your own copy of past witness
- * records (they are a few hundred bytes of JSON) somewhere this sink's own
- * write access cannot reach, the same discipline the append-only file sink
- * already asks for.
+ * cannot provide from inside itself — a copy of past witness records
+ * somewhere this sink's own write access cannot reach. `src/witness-ledger.ts`
+ * turns that from advice into a feature: every witness is appended to a local
+ * ledger, the ledger is backed up on request, and a commit the ledger proves
+ * was pushed but GitHub can no longer produce is reported as a rewrite.
  */
 import { execFileSync } from 'node:child_process';
 
@@ -51,6 +52,29 @@ export type GhExec = (args: string[], input?: string) => string;
 
 function defaultGhExec(args: string[], input?: string): string {
   return execFileSync('gh', args, { input, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+/** What `gh` said on stderr when it failed, or the error's own message when it said nothing (an injected exec, a spawn failure). */
+function errorText(e: unknown): string {
+  const stderr = (e as { stderr?: unknown }).stderr;
+  const text = typeof stderr === 'string' ? stderr : Buffer.isBuffer(stderr) ? stderr.toString('utf8') : '';
+  return (text.trim() ? text : e instanceof Error ? e.message : String(e)).trim();
+}
+
+/**
+ * Did GitHub answer "that is not there", as opposed to failing to answer at
+ * all? The difference is the whole tamper signal: a missing commit is
+ * evidence, a dropped connection, a rate limit or an expired token is not.
+ * GitHub answers a SHA it does not hold with 422 ("No commit found") and a
+ * missing path or ref with 404. Anything else — no network, 5xx, 401, 403 — is
+ * "could not check", and is never read as "not there".
+ *
+ * Caveat, stated where it bites: for a *private* repo GitHub also answers 404
+ * to an account that cannot see it, so the wrong `gh` login reads as "not
+ * there". Public repos, which is what a witness should be, do not have that.
+ */
+export function isNotFound(e: unknown): boolean {
+  return /HTTP (404|410|422)\b|not found|no commit found/i.test(errorText(e));
 }
 
 export interface GitHubAnchorOptions {
@@ -86,59 +110,102 @@ function decodeContent(base64: string): string {
   return Buffer.from(base64.replace(/\n/g, ''), 'base64').toString('utf8');
 }
 
-function nonEmptyLines(text: string): string[] {
+export function nonEmptyLines(text: string): string[] {
   return text.split('\n').filter((l) => l.length > 0);
 }
 
+const REPO_SPEC = /^[\w.-]+\/[\w.-]+$/;
+
 /**
- * Commit one more line to the public anchor file and return a witness a
- * verifier can check independently later. Append-only is enforced here, not
- * left to convention: the new file content is built by extending the exact
- * bytes read back from GitHub, and the write is refused — nothing is pushed
- * — if the content about to be sent does not literally begin with what was
- * already there.
+ * Read a file at a ref (branch name or commit SHA). Returns undefined when
+ * GitHub says the file is not there; throws on anything else, so a network
+ * failure can never be mistaken for an empty log.
  */
-export function writeGitHubAnchor(anchor: Anchor, opts: GitHubAnchorOptions): GitHubWitness {
-  if (!/^[\w.-]+\/[\w.-]+$/.test(opts.repo)) throw new Error(`not an "owner/name" repo spec: ${opts.repo}`);
+export function readGitHubFile(repo: string, ref: string, path: string, exec: GhExec = defaultGhExec): { sha: string; raw: string } | undefined {
+  let out: string;
+  try {
+    out = exec(['api', `repos/${repo}/contents/${path}?ref=${ref}`]);
+  } catch (e) {
+    if (isNotFound(e)) return undefined;
+    throw e;
+  }
+  const json = JSON.parse(out) as { sha: string; content: string };
+  return { sha: json.sha, raw: decodeContent(json.content) };
+}
+
+/**
+ * The one place this project writes to a GitHub file. `plan` sees the lines
+ * already in the file and returns the lines to add (throw from it to refuse;
+ * return none to write nothing). Append-only is enforced here, not left to
+ * convention: the new file content is built by extending the exact bytes read
+ * back from GitHub, and the write is refused — nothing is pushed — if the
+ * content about to be sent does not literally begin with what was already
+ * there. Both the anchor log and a witness-ledger backup go through this.
+ */
+export function appendLinesToGitHubFile(
+  opts: GitHubAnchorOptions & { message: string; defaultPath: string },
+  plan: (existingLines: string[]) => string[],
+): { commitSha: string; committedAt: string; firstLine: number } | undefined {
+  if (!REPO_SPEC.test(opts.repo)) throw new Error(`not an "owner/name" repo spec: ${opts.repo}`);
   const repo = opts.repo;
   const branch = opts.branch ?? 'main';
-  const path = opts.path ?? 'anchors.jsonl';
+  const path = opts.path ?? opts.defaultPath;
   const exec = opts.ghExec ?? defaultGhExec;
 
-  let existingRaw = '';
-  let sha: string | undefined;
-  try {
-    const out = exec(['api', `repos/${repo}/contents/${path}?ref=${branch}`]);
-    const json = JSON.parse(out) as { sha: string; content: string };
-    sha = json.sha;
-    existingRaw = decodeContent(json.content);
-  } catch {
-    // No file yet on this branch (first anchor, or the branch/repo is fresh).
-    // Nothing to preserve; the write below creates it.
-  }
+  // Only "no file here" means a fresh log. A failed read must not: writing on
+  // top of a file that could not be read is exactly the mistake to refuse.
+  const existing = readGitHubFile(repo, branch, path, exec);
+  const existingRaw = existing?.raw ?? '';
+  const existingLines = nonEmptyLines(existingRaw);
 
-  const newLine = formatAnchor(anchor);
-  const newRaw = existingRaw.length === 0 || existingRaw.endsWith('\n') ? existingRaw + newLine + '\n' : existingRaw + '\n' + newLine + '\n';
+  const toAdd = plan(existingLines);
+  if (toAdd.length === 0) return undefined;
+
+  const addition = toAdd.join('\n') + '\n';
+  const newRaw = existingRaw.length === 0 || existingRaw.endsWith('\n') ? existingRaw + addition : existingRaw + '\n' + addition;
 
   if (!newRaw.startsWith(existingRaw)) {
     // Cannot happen given how newRaw is built above; kept as a hard stop in
     // case this function is ever refactored to build content another way.
-    throw new Error('refusing to write to the GitHub anchor sink: new content does not extend the existing file byte-for-byte');
+    throw new Error('refusing to write to the GitHub sink: new content does not extend the existing file byte-for-byte');
   }
 
-  const line = nonEmptyLines(existingRaw).length;
   const body = {
-    message: `anchor: ${anchor.session} seq=${anchor.seq} ${anchor.hash.slice(0, 12)}`,
+    message: opts.message,
     content: Buffer.from(newRaw, 'utf8').toString('base64'),
     branch,
-    ...(sha ? { sha } : {}),
+    ...(existing?.sha ? { sha: existing.sha } : {}),
   };
 
   const out = exec(['api', `repos/${repo}/contents/${path}`, '-X', 'PUT', '--input', '-'], JSON.stringify(body));
   const resp = JSON.parse(out) as { commit: { sha: string; committer?: { date?: string }; author?: { date?: string } } };
   const committedAt = resp.commit.committer?.date ?? resp.commit.author?.date ?? '';
+  return { commitSha: resp.commit.sha, committedAt, firstLine: existingLines.length };
+}
 
-  return { provider: 'github', repo, branch, path, commitSha: resp.commit.sha, committedAt, line, anchor };
+/**
+ * Commit one more line to the public anchor file and return a witness a
+ * verifier can check independently later. See `appendLinesToGitHubFile` for
+ * how append-only is enforced.
+ */
+export function writeGitHubAnchor(anchor: Anchor, opts: GitHubAnchorOptions): GitHubWitness {
+  const branch = opts.branch ?? 'main';
+  const path = opts.path ?? 'anchors.jsonl';
+  const done = appendLinesToGitHubFile(
+    { ...opts, branch, path, defaultPath: 'anchors.jsonl', message: `anchor: ${anchor.session} seq=${anchor.seq} ${anchor.hash.slice(0, 12)}` },
+    () => [formatAnchor(anchor)],
+  )!;
+  return { provider: 'github', repo: opts.repo, branch, path, commitSha: done.commitSha, committedAt: done.committedAt, line: done.firstLine, anchor };
+}
+
+export interface WitnessCheck {
+  /** True only when nothing was wrong AND every fetch was answered. An unanswered fetch is not a pass. */
+  ok: boolean;
+  /** True when at least one fetch failed for a reason other than "GitHub says it is not there" (network, rate limit, auth). Not a tamper signal. */
+  unreachable: boolean;
+  findings: Finding[];
+  /** The non-empty lines of the file as it stood at the witnessed commit; absent when the file could not be read there. */
+  lines?: string[];
 }
 
 /**
@@ -148,11 +215,21 @@ export function writeGitHubAnchor(anchor: Anchor, opts: GitHubAnchorOptions): Gi
  * is the point: it is what still catches the anchor after the branch has
  * moved on, and stops catching it only once the commit itself is no longer
  * fetchable (see the module doc for that honest limit).
+ *
+ * "GitHub says it is not there" is a tamper finding; "GitHub did not answer"
+ * is `WITNESS_UNREACHABLE`, a warning that leaves `ok` false but is not
+ * evidence of anything.
  */
-export function verifyGitHubWitness(witness: GitHubWitness, opts: { ghExec?: GhExec } = {}): { ok: boolean; findings: Finding[] } {
+export function verifyGitHubWitness(witness: GitHubWitness, opts: { ghExec?: GhExec } = {}): WitnessCheck {
   const exec = opts.ghExec ?? defaultGhExec;
   const findings: Finding[] = [];
+  let unreachable = false;
   const add = (code: string, severity: Severity, message: string) => findings.push({ code, severity, message });
+  const cannotReach = (what: string, e: unknown) => {
+    unreachable = true;
+    add('WITNESS_UNREACHABLE', 'warn', `could not check ${what}: ${errorText(e)}`);
+  };
+  const done = (lines?: string[]): WitnessCheck => ({ ok: !unreachable && !findings.some((f) => f.severity === 'tamper'), unreachable, findings, lines });
 
   let commitDate: string | undefined;
   try {
@@ -160,8 +237,9 @@ export function verifyGitHubWitness(witness: GitHubWitness, opts: { ghExec?: GhE
     const json = JSON.parse(out) as { commit?: { committer?: { date?: string }; author?: { date?: string } } };
     commitDate = json.commit?.committer?.date ?? json.commit?.author?.date;
   } catch (e) {
-    add('WITNESS_COMMIT_NOT_FOUND', 'tamper', `commit ${witness.commitSha} does not exist in ${witness.repo}: ${(e as Error).message.trim()}`);
-    return { ok: false, findings };
+    if (isNotFound(e)) add('WITNESS_COMMIT_NOT_FOUND', 'tamper', `commit ${witness.commitSha} does not exist in ${witness.repo}: ${errorText(e)}`);
+    else cannotReach(`commit ${witness.commitSha} in ${witness.repo}`, e);
+    return done();
   }
 
   if (commitDate !== witness.committedAt) {
@@ -172,22 +250,26 @@ export function verifyGitHubWitness(witness: GitHubWitness, opts: { ghExec?: GhE
     );
   }
 
+  let lines: string[] | undefined;
   try {
-    const out = exec(['api', `repos/${witness.repo}/contents/${witness.path}?ref=${witness.commitSha}`]);
-    const json = JSON.parse(out) as { content: string };
-    const lines = nonEmptyLines(decodeContent(json.content));
-    const actual = lines[witness.line];
-    const expected = formatAnchor(witness.anchor);
-    if (actual === undefined) {
-      add('WITNESS_LINE_MISSING', 'tamper', `commit ${witness.commitSha} has no line ${witness.line} in ${witness.path} (file has ${lines.length} lines)`);
-    } else if (actual !== expected) {
-      add('WITNESS_CONTENT_MISMATCH', 'tamper', `line ${witness.line} of ${witness.path} at commit ${witness.commitSha} does not match the anchor this witness claims`);
+    const file = readGitHubFile(witness.repo, witness.commitSha, witness.path, exec);
+    if (!file) {
+      add('WITNESS_FILE_NOT_FOUND', 'tamper', `${witness.path} does not exist at commit ${witness.commitSha}`);
+    } else {
+      lines = nonEmptyLines(file.raw);
+      const actual = lines[witness.line];
+      const expected = formatAnchor(witness.anchor);
+      if (actual === undefined) {
+        add('WITNESS_LINE_MISSING', 'tamper', `commit ${witness.commitSha} has no line ${witness.line} in ${witness.path} (file has ${lines.length} lines)`);
+      } else if (actual !== expected) {
+        add('WITNESS_CONTENT_MISMATCH', 'tamper', `line ${witness.line} of ${witness.path} at commit ${witness.commitSha} does not match the anchor this witness claims`);
+      }
     }
   } catch (e) {
-    add('WITNESS_FILE_NOT_FOUND', 'tamper', `could not read ${witness.path} at commit ${witness.commitSha}: ${(e as Error).message.trim()}`);
+    cannotReach(`${witness.path} at commit ${witness.commitSha}`, e);
   }
 
-  return { ok: !findings.some((f) => f.severity === 'tamper'), findings };
+  return done(lines);
 }
 
 export class GitHubAnchorSink implements AnchorSink<GitHubWitness> {
