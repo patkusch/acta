@@ -571,19 +571,19 @@ read-only: a copy of the ledger with one digit of a SHA changed came back
 `WITNESS_REWRITTEN`, exit 1, and with the network cut it came back
 `WITNESS_UNREACHABLE`, exit 2.
 
-**Why not a real transparency log (Sigstore Rekor).** Rekor's `hashedrekord`
+**Why the GitHub witness exists at all, historically.** Rekor's `hashedrekord`
 entry needs an Ed25519**ph** signature — the pre-hashed variant of Ed25519,
-RFC 8032 §5.1.6 — and Node's `node:crypto` only signs plain Ed25519; the
-pre-hash mode is not exposed. Rekor's `rekord` entry type avoids that by
-taking the artifact itself rather than a pre-hash, which Node can sign today,
-but it depends on the v1 public instance, which is mid-migration. Neither is
-buildable on solid ground right now. A GitHub commit sidesteps the blocker
-entirely rather than waiting on it, at the cost of a weaker, centrally-run
-witness instead of a dedicated transparency-log network with independent
-operators and inclusion proofs. `writeGitHubAnchor` implements the same
-`AnchorSink` interface a Rekor sink would, so swapping one in later — once the
-signature gap closes, or using a language binding that can produce Ed25519ph
-— does not touch the recorder or the verifier.
+RFC 8032 §5.1.6 — and as of 2026-09-16, when this GitHub sink was built,
+Node's `node:crypto` only signed plain Ed25519; the pre-hash mode was not
+exposed, and no other piece of this project's toolchain filled the gap
+either. A GitHub commit sidesteps that entirely rather than waiting on it,
+at the cost of a weaker, centrally-run witness instead of a dedicated
+transparency-log network with independent operators and inclusion proofs.
+That blocker was re-checked for real on 2026-09-22 and turned out to no
+longer hold — see [the next section](#a-public-transparency-log-witness-rekor).
+`writeGitHubAnchor` implements the same `AnchorSink` interface the Rekor sink
+now also implements, so the recorder and verifier never had to change for
+either.
 
 ```ts
 import { writeGitHubAnchor, verifyGitHubWitness } from './src/github-anchor.ts';
@@ -599,6 +599,118 @@ appendWitness('witnesses.jsonl', witness);
 backupWitnessLedger('witnesses.jsonl', parseBackupTarget('/Volumes/usb/witnesses.jsonl'));
 verifyWitnessLedger('witnesses.jsonl').verdict  // 'clean' | 'tampered' | 'unreachable' | 'empty'
 ```
+
+### A public transparency-log witness (Rekor)
+
+The README used to say a real Sigstore Rekor entry was blocked on two
+things at once: Node's `node:crypto` cannot produce an Ed25519ph signature,
+and Rekor's public write path was thought to be shaky mid-migration to
+`rekor-tiles` (Rekor v2). Re-checked for real on 2026-09-22, instead of
+assuming either was still true:
+
+- **The signature gap is closed.** `@noble/curves` 2.4.0 exports
+  `ed25519ph` (`@noble/curves/ed25519.js`), a real RFC 8032 §5.1
+  implementation — signed and verified against the RFC's own §7.3 test
+  vector (message `"abc"`) byte-for-byte before any of this was wired up.
+  This is the project's first runtime dependency, pinned exact rather than
+  a range. Node's own `generateKeyPairSync('ed25519')` keys work with it —
+  the two libraries derive the same public key from the same seed and
+  cross-verify each other's plain-Ed25519 signatures — so PEM/SPKI key
+  export still goes through `node:crypto` everywhere it can; `@noble/curves`
+  is used for exactly the one thing Node cannot do.
+- **The write path was never really the blocker.** `rekor.sigstore.dev`
+  (Rekor v1) is still the public-good instance's default log — Rekor v2 is
+  GA, but the public instance has not cut over — and `hashedrekord` v0.0.1
+  has taken Ed25519ph keys since
+  [sigstore/rekor#1945](https://github.com/sigstore/rekor/pull/1945),
+  merged 2024-03-04. `/api/v1/log/entries` answered a live GET and a live
+  POST when checked directly. Reading `pkg/signature/ed25519ph.go` in
+  `sigstore/sigstore` settled the one open question — what a hashedrekord
+  entry with an Ed25519ph key actually needs: `data.hash.algorithm` must be
+  `sha512`, and the signature is produced by signing the artifact directly
+  (Ed25519ph does its own SHA-512 prehash internally, per the RFC), not by
+  signing an externally-computed digest.
+
+`src/rekor-anchor.ts`'s `writeRekorAnchor` submits a `hashedrekord` entry for
+an anchor and returns a `RekorWitness`: the UUID, log index, log ID,
+integrated time, and the raw public key used to sign — enough for
+`verifyRekorWitness` to re-fetch the entry **by UUID** later and check it
+independently, the same pattern as the GitHub witness re-fetching by commit
+SHA rather than trusting the record it was handed.
+
+**What `verifyRekorWitness` actually checks**, all against a fresh fetch,
+never the witness's own cached fields: the entry's data hash really is
+SHA-512 of the anchor line; the entry's Ed25519ph signature really verifies
+against that anchor and the public key the witness names; the entry's
+`logID` and `integratedTime` match what was recorded; and — the part a
+transparency log is actually for — the inclusion proof Rekor hands back
+**recomputes to the root it claims**, via a real RFC 6962 Merkle audit-path
+implementation (leaf hash, inner nodes, border nodes) ported from and
+checked against `transparency-dev/merkle`'s `proof.go`, the same code
+Rekor's own client uses. That recomputation was proven against a real,
+independently-fetched entry (`rekor.sigstore.dev`, log index 1, a 22-hash
+proof against a tree with over 4.1 million entries) before any of this was
+written, and it is checked again as a fixture-based unit test in
+[`test/rekor-anchor.test.ts`](test/rekor-anchor.test.ts).
+
+**The real submission, done once, for real, on 2026-09-22:** a genuine acta
+session (open, one call, one result, close) anchored to
+`rekor.sigstore.dev`, fetched back by UUID, and verified:
+
+```
+uuid:            108e9186e8c5677a1e69c0dc0dc221fc96bc03a2087d5539615e8bb0b1a5b60f481ac6665ffeb67f
+logIndex:        2909493026
+logID:           c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d
+integratedTime:  1790083678  (2026-09-22T13:27:58Z)
+verifyRekorWitness(witness).ok → true, findings: []
+```
+
+Tamper cases run for real too, against that live entry: a witness claiming
+the wrong public key comes back `REKOR_PUBLIC_KEY_MISMATCH`; a witness
+pointed at a UUID that does not exist comes back `REKOR_ENTRY_NOT_FOUND`,
+not `REKOR_UNREACHABLE` — same distinction the GitHub witness draws between
+"the server said no" and "the server did not answer." A public search UI
+entry exists for this submission at
+[search.sigstore.dev](https://search.sigstore.dev/?logIndex=2909493026).
+
+**What this proves**, same shape as the GitHub witness: the anchor existed
+by the time it was integrated, checkably by anyone, against a real
+transparency log rather than one party's commit history.
+
+**What this does not prove yet**, and the [Not built](#not-built) section
+says so precisely: `verifyRekorWitness` does not check the checkpoint's own
+signature (the signed statement of the root hash the inclusion proof is
+checked against), and it checks one submission at a time, not consistency
+across submissions the way the witness ledger does for GitHub. A dishonest
+log could still forge the root hash it answers with — though not without
+also producing a valid Ed25519ph signature from a key that signed something
+else, which is the part this module's checks actually anchor their trust
+in.
+
+```ts
+import { writeRekorAnchor, verifyRekorWitness } from './src/rekor-anchor.ts';
+import { generateKeyPairSync } from 'node:crypto';
+
+// A dedicated Ed25519 identity for this witness role — caller manages persistence.
+const { privateKey } = generateKeyPairSync('ed25519');
+const secretKey = Buffer.from(privateKey.export({ format: 'jwk' }).d, 'base64url');
+
+const witness = writeRekorAnchor(anchor, { secretKey });
+// { provider: 'rekor', rekorUrl, uuid, logIndex, logID, integratedTime, publicKeyHex, anchor }
+
+verifyRekorWitness(witness).ok  // re-fetches by uuid; recomputes the Merkle inclusion proof from scratch
+```
+
+| finding | severity | meaning |
+|:--|:--|:--|
+| `REKOR_ENTRY_NOT_FOUND` | tamper | the UUID this witness names does not exist at that Rekor instance any more |
+| `REKOR_HASH_MISMATCH` | tamper | the entry's `data.hash` is not SHA-512 of the anchor this witness claims |
+| `REKOR_SIGNATURE_MISSING`, `REKOR_SIGNATURE_INVALID` | tamper | the entry has no signature, or it does not verify against the claimed anchor and key |
+| `REKOR_PUBLIC_KEY_MISMATCH` | tamper | the entry's public key is not the one the witness names |
+| `REKOR_LOG_ID_MISMATCH`, `REKOR_INTEGRATED_TIME_MISMATCH` | tamper | the entry's logID or integration time disagree with what was recorded |
+| `REKOR_BODY_UNPARSEABLE` | tamper | the entry's body is not the JSON a hashedrekord entry should be |
+| `REKOR_INCLUSION_PROOF_MISSING`, `REKOR_INCLUSION_PROOF_INVALID` | tamper | no inclusion proof was returned, or it does not recompute to the claimed root |
+| `REKOR_UNREACHABLE` | warn | Rekor did not answer (network, rate limit) — never a pass, never tamper on its own |
 
 ## Findings reference
 
@@ -660,11 +772,23 @@ on its own, whatever the ledger's own verdict says.
 
 ## Not built
 
-- **A dedicated transparency-log network** (Sigstore Rekor or similar), with
-  independent operators and cryptographic inclusion proofs. [A public GitHub
-  commit is a real, checkable witness](#a-public-anchor-witness) — but it is
-  one party's server, not a network, and it is honest about that gap in the
-  section linked above.
+- **Checkpoint-signature and log-consistency verification for the Rekor
+  witness.** [`RekorAnchorSink` submits to a real transparency log and
+  recomputes a real Merkle inclusion proof](#a-public-transparency-log-witness-rekor)
+  — the recomputation is genuine, not decorative, and checked against real
+  fetched log data. What it does not yet do: verify the checkpoint's own
+  signature (so a dishonest log could still forge the root hash the
+  inclusion proof is checked against, though not without also forging a
+  valid signature from a key that signed something else), and it checks one
+  submission at a time rather than log consistency over repeated
+  submissions the way [the witness ledger](#the-witness-ledger) does for
+  the GitHub sink. Closing this needs porting `pkg/verify/verify.go`'s
+  `VerifyCheckpointSignature` (a "signed note" format, not plain
+  ECDSA-over-SHA256) and something like a `witness-ledger.ts` for Rekor
+  entries specifically. Dated 2026-09-22 — see the section linked above for
+  what was actually checked before writing this, and why the Ed25519ph
+  blocker this used to be filed under turned out not to be the real one any
+  more.
 
 ## License
 
