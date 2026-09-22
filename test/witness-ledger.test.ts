@@ -1,14 +1,18 @@
 /**
- * The witness ledger: append-only local record of every GitHub witness, a
- * backup that refuses to hide a rewrite, and a verifier that turns "GitHub can
- * no longer produce a commit my ledger says it pushed" into a tamper finding
- * while keeping "GitHub did not answer" apart from it.
+ * The witness ledger: append-only local record of every GitHub or Rekor
+ * witness, a backup that refuses to hide a rewrite, and a verifier that
+ * turns "the provider can no longer produce what my ledger says it once
+ * held" into a tamper finding while keeping "the provider did not answer"
+ * apart from it. For Rekor witnesses specifically, it also checks
+ * consistency between each consecutive pair filed — see the "Rekor
+ * witnesses" section below.
  *
- * Everything runs against the in-memory fake in fake-github.ts through the
- * injectable `ghExec`, so `npm test` never touches the network. The same fake
- * sits behind a fake `gh` on PATH for the command-line tests at the bottom.
- * The one real round trip against patkusch/acta-anchors is a separate manual
- * step, documented in the README.
+ * Everything runs against in-memory fakes (fake-github.ts, fake-rekor.ts)
+ * through the injectable `ghExec`/`rekorExec`, so `npm test` never touches
+ * the network. The GitHub fake sits behind a fake `gh` on PATH for the
+ * command-line tests at the bottom. The one real round trip against
+ * patkusch/acta-anchors (GitHub) and the real Rekor submissions are separate
+ * manual steps, documented in the README.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { writeGitHubAnchor, verifyGitHubWitness, type GitHubWitness } from '../src/github-anchor.ts';
+import { writeRekorAnchor, type RekorExec } from '../src/rekor-anchor.ts';
 import { formatAnchor, type Anchor } from '../src/anchor.ts';
 import {
   WitnessBackupRefused,
@@ -31,6 +36,7 @@ import {
 } from '../src/witness-ledger.ts';
 import { recordSampleSession } from '../src/fixtures/session.ts';
 import { NETWORK, fakeExec, forcePush, headContent, newState, rewriteHead, type FakeState } from './fake-github.ts';
+import { fakeGrowingRekor, testRekorSeed } from './fake-rekor.ts';
 
 const scratch = () => mkdtempSync(join(tmpdir(), 'acta-wl-'));
 const anchor = (n: number): Anchor => ({ session: 'sess-1234abcd', seq: n, hash: String(n).repeat(64).slice(0, 64), at: `2026-09-18T08:0${n}:00.000Z` });
@@ -62,10 +68,10 @@ test('appendWitness files each witness as one line, keeps every earlier byte, an
   assert.deepEqual(parsed.problems, []);
   assert.deepEqual(parsed.records.map((r) => r.witness), witnesses);
   // every field the feature promises is in the record
-  const w = parsed.records[0].witness;
+  const w = parsed.records[0].witness as GitHubWitness;
   assert.ok(w.repo && w.branch && w.path && w.commitSha && w.committedAt && w.anchor.hash && w.anchor.session);
   assert.equal(w.line, 0);
-  assert.equal(parsed.records[1].witness.line, 1);
+  assert.equal((parsed.records[1].witness as GitHubWitness).line, 1);
 
   assert.deepEqual(appendWitness(ledger, witnesses[0]), { appended: false });
   assert.equal(readFileSync(ledger, 'utf8'), text, 're-filing the same witness changes nothing');
@@ -333,6 +339,113 @@ test('an unreadable ledger line is reported, and an empty ledger is not called c
   const empty = join(scratch(), 'empty.jsonl');
   writeFileSync(empty, '');
   assert.equal(verifyWitnessLedger(empty, { ghExec }).verdict, 'empty');
+});
+
+// --- Rekor witnesses, and cross-submission consistency between them --------------
+//
+// Same fake growing log as rekor-anchor.test.ts (shared via fake-rekor.ts): a
+// real, growing RFC 6962 tree, real inclusion proofs, real ECDSA-signed
+// checkpoints. Every fake entry here goes through the real `writeRekorAnchor`
+// (against the fake's injected exec) so the witness object matches exactly
+// what the fake actually stored — the same way a real submission would.
+// What is new in this file is the ledger side — filing more than one Rekor
+// witness and having `verifyWitnessLedger` check consistency between them,
+// in the order they were filed, the way it already checks a GitHub log's
+// head against each commit.
+
+function submitFakeRekorAnchor(log: ReturnType<typeof fakeGrowingRekor>, a: Anchor) {
+  return writeRekorAnchor(a, { secretKey: testRekorSeed(), exec: log.exec, rekorUrl: 'https://fake' });
+}
+
+test('a Rekor ledger of two honest submissions is clean, and the second record carries the consistency check', () => {
+  const log = fakeGrowingRekor();
+  const w1 = submitFakeRekorAnchor(log, anchor(1));
+  const w2 = submitFakeRekorAnchor(log, anchor(2));
+  const ledger = join(scratch(), 'witnesses.jsonl');
+  appendWitness(ledger, w1);
+  appendWitness(ledger, w2);
+
+  const report = verifyWitnessLedger(ledger, { rekorExec: log.exec, rekorCheckpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.equal(report.verdict, 'clean');
+  assert.equal(report.records.length, 2);
+  assert.deepEqual(report.records[0].findings, []);
+  assert.deepEqual(report.records[1].findings, []);
+});
+
+test('a lone Rekor witness in the ledger is checked (verifyRekorWitness) but has no consistency check to run yet', () => {
+  const log = fakeGrowingRekor();
+  const w1 = submitFakeRekorAnchor(log, anchor(1));
+  const ledger = join(scratch(), 'witnesses.jsonl');
+  appendWitness(ledger, w1);
+
+  const report = verifyWitnessLedger(ledger, { rekorExec: log.exec, rekorCheckpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.equal(report.verdict, 'clean');
+  assert.equal(report.records.length, 1);
+});
+
+test('a ledger mixing a GitHub witness and Rekor witnesses checks each against its own provider', () => {
+  const { ghExec } = honest(0);
+  const log = fakeGrowingRekor();
+  const ghWitness = writeGitHubAnchor(anchor(0), { repo: REPO, ghExec });
+  const r1 = submitFakeRekorAnchor(log, anchor(1));
+  const r2 = submitFakeRekorAnchor(log, anchor(2));
+  const ledger = join(scratch(), 'witnesses.jsonl');
+  appendWitness(ledger, ghWitness);
+  appendWitness(ledger, r1);
+  appendWitness(ledger, r2);
+
+  const report = verifyWitnessLedger(ledger, { ghExec, rekorExec: log.exec, rekorCheckpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.equal(report.verdict, 'clean');
+  assert.equal(report.records.length, 3);
+  assert.equal(report.records[0].witness.provider, 'github');
+  assert.equal(report.records[1].witness.provider, 'rekor');
+  assert.equal(report.records[2].witness.provider, 'rekor');
+});
+
+test("a Rekor log that quietly rewrote history between two of the caller's own submissions is caught, even though each entry checks out on its own", () => {
+  const log = fakeGrowingRekor();
+  const w1 = submitFakeRekorAnchor(log, anchor(1));
+  submitFakeRekorAnchor(log, anchor(2));
+  const w3 = submitFakeRekorAnchor(log, anchor(3));
+  const ledger = join(scratch(), 'witnesses.jsonl');
+  appendWitness(ledger, w1);
+  appendWitness(ledger, w3);
+
+  // Both entries are untouched and each verifies fine on its own — the tamper
+  // is only in what the log's own /api/v1/log/proof answers for the
+  // *consistency* proof between them, which is exactly the case a
+  // per-submission check alone cannot catch.
+  const rekorExec: RekorExec = (method, url, body) => {
+    const real = log.exec(method, url, body);
+    if (method === 'GET' && url.includes('/api/v1/log/proof')) {
+      const parsed = JSON.parse(real.body) as { hashes: string[]; rootHash: string };
+      parsed.hashes = parsed.hashes.map(() => '00'.repeat(32));
+      return { status: real.status, body: JSON.stringify(parsed) };
+    }
+    return real;
+  };
+
+  const report = verifyWitnessLedger(ledger, { rekorExec, rekorCheckpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.equal(report.verdict, 'tampered');
+  // The first record (w1) is clean on its own; the second (w3) carries the
+  // consistency failure the ledger caught between the two submissions.
+  assert.deepEqual(report.records[0].findings, []);
+  assert.ok(report.records[1].findings.some((f) => f.code === 'REKOR_CONSISTENCY_PROOF_INVALID'));
+});
+
+test('a Rekor entry the log can no longer produce is tamper, and never dilutes a clean earlier record', () => {
+  const log = fakeGrowingRekor();
+  const w1 = submitFakeRekorAnchor(log, anchor(1));
+  const w2 = submitFakeRekorAnchor(log, anchor(2));
+  const ledger = join(scratch(), 'witnesses.jsonl');
+  appendWitness(ledger, w1);
+  appendWitness(ledger, w2);
+  log.entries.delete(w2.uuid);
+
+  const report = verifyWitnessLedger(ledger, { rekorExec: log.exec, rekorCheckpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.equal(report.verdict, 'tampered');
+  assert.deepEqual(report.records[0].findings, []);
+  assert.ok(report.records[1].findings.some((f) => f.code === 'REKOR_ENTRY_NOT_FOUND'));
 });
 
 // --- the command line, end to end, against a fake `gh` on PATH --------------------

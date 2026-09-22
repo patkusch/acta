@@ -4,15 +4,17 @@
  * acta anchor [dir] [--to file] [--append-to file] [--git [--repo path]]   write the current head as an anchor
  * acta witness backup [ledger] --to <path | owner/name[:branch]>   copy the witness ledger somewhere else you control
  * acta witness add <witness.json> [--ledger path]                  file an existing witness in the ledger
- * acta verify --witnesses <witnesses.jsonl>                        check every recorded witness against GitHub
+ * acta verify --witnesses <witnesses.jsonl>                        check every recorded witness against its provider (GitHub and/or Rekor)
  * acta show   [dir]                          print the timeline
  * acta mcp    [--dir d] [--resume [--rotate-on-resume]] [--anchor-every n] [--anchor-to file | --anchor-append-to file] -- <command...>
  */
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { generateKeyPairSync } from 'node:crypto';
 
 import { readAnchors, formatAnchor, writeAnchor, writeGitAnchor, readGitAnchors, writeAppendOnlyAnchor, appendOnlySupport } from './anchor.ts';
 import { writeGitHubAnchor, verifyGitHubWitness, parseRepoSpec, type GitHubWitness } from './github-anchor.ts';
+import { writeRekorAnchor, verifyRekorWitness, type RekorWitness } from './rekor-anchor.ts';
 import {
   WITNESS_LEDGER_FILE,
   WitnessBackupRefused,
@@ -62,7 +64,7 @@ function usage(code: number): never {
       '  acta init   [dir]',
       '  acta verify [dir] [--key recorder.pub] [--anchors anchors.jsonl] [--git [--repo path]] [--witness witness.json] [--strict] [--json]',
       '  acta verify --witnesses witnesses.jsonl [--json]',
-      '  acta anchor [dir] [--to anchors.jsonl] [--append-to anchors.jsonl] [--git [--repo path]] [--github owner/name[:branch] [--github-path file] [--witness-out file] [--witness-ledger witnesses.jsonl]]',
+      '  acta anchor [dir] [--to anchors.jsonl] [--append-to anchors.jsonl] [--git [--repo path]] [--github owner/name[:branch] [--github-path file]] [--rekor [--rekor-url url]] [--witness-out file] [--witness-ledger witnesses.jsonl]',
       '  acta witness backup [witnesses.jsonl | dir] --to <path | owner/name[:branch]> [--backup-path file]',
       '  acta witness add witness.json [--ledger witnesses.jsonl]',
       '  acta show   [dir]',
@@ -74,6 +76,18 @@ function usage(code: number): never {
 
 function ledgerDir(): string {
   return resolve(positional() ?? '.acta');
+}
+
+const REKOR_KEY_FILE = 'rekor-witness.key';
+
+/** A dedicated Ed25519 identity for the Rekor witness role, separate from the recorder's own key — generated on first use and kept in the ledger dir as a raw 32-byte seed, hex-encoded, mode 0600. Reused across `anchor --rekor` calls so every witness this ledger files traces to the same key, which is what makes repeated submissions checkable as one continuing log rather than unrelated ones. */
+function loadOrCreateRekorKey(dir: string): Buffer {
+  const path = join(dir, REKOR_KEY_FILE);
+  if (existsSync(path)) return Buffer.from(readFileSync(path, 'utf8').trim(), 'hex');
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const seed = Buffer.from((privateKey.export({ format: 'jwk' }) as { d: string }).d, 'base64url');
+  writeFileSync(path, seed.toString('hex') + '\n', { mode: 0o600 });
+  return seed;
 }
 
 const colour = (status: Verdict['status']) => (status === 'verified' ? GREEN : status === 'consistent' ? YELLOW : RED);
@@ -152,11 +166,12 @@ switch (command) {
     const to = flag('--to');
     const appendTo = flag('--append-to');
     const github = flag('--github');
+    const rekor = has('--rekor');
     // The witness ledger sits beside the anchors file by default, or in the
     // ledger directory when there is none. Checked before anything is written
     // or pushed: a damaged ledger must stop the run, not turn up afterwards.
     const witnessLedger = resolve(flag('--witness-ledger') ?? join(to ? dirname(resolve(to)) : appendTo ? dirname(resolve(appendTo)) : dir, WITNESS_LEDGER_FILE));
-    if (github) {
+    if (github || rekor) {
       try {
         assertLedgerAppendable(witnessLedger);
       } catch (e) {
@@ -184,6 +199,34 @@ switch (command) {
         console.log(`${DIM}witness filed in ${witnessLedger} — \`acta witness backup\` copies it somewhere the repo's owner cannot reach; until then a rewrite is not detectable.${OFF}`);
       } catch (e) {
         // The commit is already public. Do not lose the only record of it.
+        console.error(`${RED}could not file the witness in ${witnessLedger}: ${(e as Error).message}${OFF}`);
+        console.error(JSON.stringify(witness));
+        process.exit(1);
+      }
+      const witnessOut = flag('--witness-out');
+      if (witnessOut) {
+        writeFileSync(resolve(witnessOut), JSON.stringify(witness, null, 2) + '\n');
+        console.log(`${DIM}witness also written to ${witnessOut}${OFF}`);
+      } else {
+        console.log(JSON.stringify(witness));
+      }
+    }
+    if (rekor) {
+      const secretKey = loadOrCreateRekorKey(dir);
+      const rekorUrl = flag('--rekor-url');
+      let witness: RekorWitness;
+      try {
+        witness = writeRekorAnchor(anchor, { secretKey, rekorUrl });
+      } catch (e) {
+        console.error(`${RED}could not submit to Rekor: ${(e as Error).message}${OFF}`);
+        process.exit(1);
+      }
+      console.log(`${DIM}submitted to ${witness.rekorUrl} as ${witness.uuid.slice(0, 12)}… (logIndex ${witness.logIndex})${OFF}`);
+      try {
+        appendWitness(witnessLedger, witness);
+        console.log(`${DIM}witness filed in ${witnessLedger} — a second Rekor witness in the same ledger gets cross-checked for log consistency on \`acta verify --witnesses\`.${OFF}`);
+      } catch (e) {
+        // The entry is already public. Do not lose the only record of it.
         console.error(`${RED}could not file the witness in ${witnessLedger}: ${(e as Error).message}${OFF}`);
         console.error(JSON.stringify(witness));
         process.exit(1);
@@ -224,16 +267,18 @@ switch (command) {
         if (target.kind === 'github') console.log(`${DIM}a GitHub backup is only as private as that repository; a public one shows your session ids.${OFF}`);
       } else if (sub === 'add') {
         if (!rest[0]) usage(2);
-        const witness = JSON.parse(readFileSync(resolve(rest[0]), 'utf8')) as GitHubWitness;
-        const check = verifyGitHubWitness(witness);
+        const witness = JSON.parse(readFileSync(resolve(rest[0]), 'utf8')) as GitHubWitness | RekorWitness;
+        const providerName = witness.provider === 'github' ? 'GitHub' : 'Rekor';
+        const check = witness.provider === 'github' ? verifyGitHubWitness(witness) : verifyRekorWitness(witness);
         if (!check.ok) {
-          printWitnessCheck(witness, check);
-          console.error(`${RED}not filed: GitHub does not confirm this witness right now.${OFF}`);
+          if (witness.provider === 'github') printWitnessCheck(witness, check);
+          else for (const f of check.findings) console.log(`  ${f.severity.padEnd(6)} ${f.code.padEnd(24)} ${f.message}`);
+          console.error(`${RED}not filed: ${providerName} does not confirm this witness right now.${OFF}`);
           process.exit(check.unreachable && !check.findings.some((f) => f.severity === 'tamper') ? 2 : 1);
         }
         const ledgerPath = ledgerArg(flag('--ledger'));
         const { appended } = appendWitness(ledgerPath, witness);
-        console.log(appended ? `${GREEN}filed${OFF}  ${witness.repo}@${witness.commitSha.slice(0, 12)}  in ${ledgerPath}` : `${DIM}already in ${ledgerPath}${OFF}`);
+        console.log(appended ? `${GREEN}filed${OFF}  ${describeWitnessLine(witness)}  in ${ledgerPath}` : `${DIM}already in ${ledgerPath}${OFF}`);
       } else {
         usage(2);
       }
@@ -305,26 +350,32 @@ function printVerdict(v: Verdict) {
   }
 }
 
+/** One summary line per ledger record — the fields differ by provider, the shape of the line does not. */
+function describeWitnessLine(w: GitHubWitness | RekorWitness): string {
+  return w.provider === 'github'
+    ? `${w.commitSha.slice(0, 12)}  ${w.repo}@${w.branch} ${w.path}:${w.line}  seq ${w.anchor.seq}  ${w.anchor.session.slice(0, 8)}  ${w.committedAt}`
+    : `${w.uuid.slice(0, 12)}  ${w.rekorUrl.replace(/^https?:\/\//, '')} logIndex ${w.logIndex}  seq ${w.anchor.seq}  ${w.anchor.session.slice(0, 8)}`;
+}
+
 function printWitnessLedger(report: WitnessLedgerReport, path: string) {
   const sev = (s: string) => (s === 'tamper' ? RED : s === 'warn' ? YELLOW : DIM);
   for (const f of report.ledgerFindings) console.log(`${RED}${f.code}${OFF}  ${f.message}`);
   for (const r of report.records) {
-    const w = r.witness;
     const colourOf = r.status === 'OK' ? GREEN : r.status === 'WITNESS_UNREACHABLE' ? YELLOW : RED;
-    console.log(
-      `${colourOf}${r.status.padEnd(22)}${OFF} ${w.commitSha.slice(0, 12)}  ${w.repo}@${w.branch} ${w.path}:${w.line}  seq ${w.anchor.seq}  ${w.anchor.session.slice(0, 8)}  ${w.committedAt}`,
-    );
+    console.log(`${colourOf}${r.status.padEnd(22)}${OFF} ${describeWitnessLine(r.witness)}`);
     for (const f of r.findings) console.log(`  ${sev(f.severity)}${f.severity.padEnd(6)}${OFF} ${f.code.padEnd(24)} ${f.message}`);
   }
   const n = report.records.length;
   const count = `${n} record${n === 1 ? '' : 's'} in ${path}`;
-  if (report.verdict === 'clean') console.log(`${BOLD}${GREEN}CLEAN${OFF}  ${count}, every one still on GitHub, and no log has lost a line it had.`);
+  const providers = new Set(report.records.map((r) => r.witness.provider));
+  const providerWord = providers.size === 0 ? 'its provider' : providers.size === 1 ? [...providers][0] === 'github' ? 'GitHub' : 'Rekor' : 'its provider';
+  if (report.verdict === 'clean') console.log(`${BOLD}${GREEN}CLEAN${OFF}  ${count}, every one still confirmed, and no log has lost a line — or a state — it had.`);
   else if (report.verdict === 'tampered') {
     const bad = report.records.filter((r) => r.findings.some((f) => f.severity === 'tamper')).length;
-    console.log(`${BOLD}${RED}TAMPERED${OFF}  ${bad} of ${count} failed. Your ledger proves these existed; GitHub no longer agrees.`);
+    console.log(`${BOLD}${RED}TAMPERED${OFF}  ${bad} of ${count} failed. Your ledger proves these existed; ${providerWord} no longer agrees.`);
   } else if (report.verdict === 'unreachable') {
     const bad = report.records.filter((r) => r.status === 'WITNESS_UNREACHABLE').length;
-    console.log(`${BOLD}${YELLOW}UNREACHABLE${OFF}  GitHub did not answer for ${bad} of ${count}. That is not a finding either way; try again.`);
+    console.log(`${BOLD}${YELLOW}UNREACHABLE${OFF}  ${providerWord} did not answer for ${bad} of ${count}. That is not a finding either way; try again.`);
   } else console.log(`${BOLD}${YELLOW}EMPTY${OFF}  ${path} holds no records, so there is nothing to check.`);
 }
 

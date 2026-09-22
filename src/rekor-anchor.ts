@@ -87,9 +87,35 @@
  * `verifyRekorWitness` now parses and verifies the checkpoint bundled with
  * the inclusion proof, confirms it attests to exactly the size and root the
  * proof claims, and recomputes the inclusion proof against that *verified*
- * root rather than the root the response merely asserts. What is still open
- * after this: one submission is checked at a time, not consistency across
- * submissions — see the README's "Not built" section.
+ * root rather than the root the response merely asserts.
+ *
+ * **Cross-submission log consistency — added 2026-09-23, same day.** One
+ * verified checkpoint proves an entry existed at some tree state; it says
+ * nothing about whether *later* tree states Rekor shows are honest
+ * extensions of that one, the way the witness ledger checks for the GitHub
+ * sink. `verifyLogConsistency` checks two Rekor witnesses against each
+ * other: both checkpoints verified independently first, then a real RFC
+ * 6962 consistency proof (ported from and checked against
+ * `transparency-dev/merkle`'s `proof.go`, the same source the inclusion-proof
+ * math above came from, and cross-checked against 1,640 cases from an
+ * independent textbook RFC 6962 reference implementation in this module's
+ * own test file) confirms the newer tree is a genuine append-only extension
+ * of the older one.
+ *
+ * One more real check, not assumed: `GET /api/v1/log/proof`'s own `rootHash`
+ * field cannot be trusted as "the root at `lastSize`". Requesting the same
+ * `(firstSize, lastSize, treeID)` three times in a row against the active
+ * shard came back with the `hashes` array (the actual consistency proof)
+ * byte-for-byte identical every time, but a *different* `rootHash` every
+ * time. Trillian's semantics explain why: that field is the tree's root as
+ * of the request, not as of `lastSize` — harmless on Rekor's own reference
+ * client (`pkg/verify/verify.go`'s `ProveConsistency`), which never reads it
+ * either. `verifyLogConsistency` does the same: it ignores that field and
+ * checks the proof against two independently checkpoint-verified roots
+ * instead. Proven against a real fetch before being wired in: two genuine
+ * checkpoints (one from the existing 2026-09-22 witness, one from a fresh
+ * `GET /api/v1/log`) plus a real fetched consistency proof reconstructed the
+ * second checkpoint's own already-verified root exactly.
  */
 import { execFileSync } from 'node:child_process';
 import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto';
@@ -569,4 +595,233 @@ export function verifyRekorWitness(witness: RekorWitness, opts: { exec?: RekorEx
   }
 
   return done();
+}
+
+// --- RFC 6962 consistency proof, and cross-submission log consistency ------
+//
+// Ported from and checked against transparency-dev/merkle's proof.go
+// (RootFromConsistencyProof / rootFromSubtreeConsistencyProof), the same
+// source the inclusion-proof math above came from. Specialised to the
+// start=0 case (a full consistency proof between two states of the whole
+// log), which is all `verifyLogConsistency` needs — the general subtree
+// variant (for a consistency proof rooted partway into the tree) is not
+// something Rekor's public API exposes.
+//
+// Proven against real, independently-fetched data before being wired in:
+// two genuine checkpoints (an existing witness's, and a freshly fetched
+// `GET /api/v1/log`) plus a real consistency proof fetched between their
+// sizes reconstructed the second checkpoint's own already-verified root
+// hash exactly. See the module doc for why the proof's `hashes` are used
+// but its own `rootHash` field is not.
+
+function trailingZeros(x: bigint): number {
+  if (x === 0n) return 64;
+  let n = 0;
+  while ((x & 1n) === 0n) {
+    x >>= 1n;
+    n++;
+  }
+  return n;
+}
+function chainInnerRight(seed: Buffer, proof: Buffer[], index: bigint): Buffer {
+  for (let i = 0; i < proof.length; i++) {
+    if (((index >> BigInt(i)) & 1n) === 1n) seed = hashChildren(proof[i], seed);
+  }
+  return seed;
+}
+function decompSubtreeProof(start: bigint, end: bigint, size: bigint, border: number, proof: Buffer[]): { subInner: Buffer[]; subBorder: Buffer[] } {
+  const h = bitLength((end - 1n) ^ start);
+  const forkLevel = bitLength((end - 1n) ^ (size - 1n));
+  const shift = trailingZeros(end - start);
+  const subInnerLen = Math.min(h, forkLevel) - shift;
+  const innerLen = forkLevel - shift;
+  const subBorderLen = Math.max(0, border - onesCount((end - 1n) >> BigInt(h)));
+  return { subInner: proof.slice(0, subInnerLen), subBorder: proof.slice(innerLen, innerLen + subBorderLen) };
+}
+
+/**
+ * Recompute the root of a tree of size `size2`, given the (already trusted)
+ * root of the same tree at the earlier size `size1` and a consistency proof
+ * between them. Requires `0 < size1 <= size2`. Throws on a malformed proof
+ * or a size1/size2 that make no sense, rather than silently accepting them.
+ */
+export function rootFromConsistencyProof(size1: number, size2: number, proof: Buffer[], root1: Buffer): Buffer {
+  const s1 = BigInt(size1);
+  const s2 = BigInt(size2);
+  if (s2 < s1) throw new Error(`size2 (${size2}) < size1 (${size1})`);
+  if (s1 === 0n) throw new Error('consistency proof from an empty tree is meaningless');
+  if (s1 === s2) {
+    if (proof.length > 0) throw new Error('size1=size2, but the proof is not empty');
+    return root1;
+  }
+  if (proof.length === 0) throw new Error('empty consistency proof');
+
+  const start = 0n;
+  const end = s1;
+  const size = s2;
+  const { inner: forkLevel, border } = decompInclProof(end - 1n, size);
+  const shift = trailingZeros(end - start);
+  const inner = forkLevel - shift;
+  let seed = proof[0];
+  let pStart = 1;
+  if (end - start === 1n << BigInt(shift)) {
+    seed = root1;
+    pStart = 0;
+  }
+  if (proof.length !== pStart + inner + border) {
+    throw new Error(`wrong consistency proof length ${proof.length}, want ${pStart + inner + border}`);
+  }
+  const rest = proof.slice(pStart);
+  const mask = (end - 1n) >> BigInt(shift);
+
+  if (pStart === 1) {
+    const { subInner, subBorder } = decompSubtreeProof(start, end, size, border, rest);
+    let hash1 = chainInnerRight(seed, subInner, mask);
+    hash1 = chainBorderRight(hash1, subBorder);
+    if (!hash1.equals(root1)) {
+      throw new Error(`consistency proof does not chain to the given root at size ${size1}: got ${toHex(hash1)}, want ${toHex(root1)}`);
+    }
+  }
+
+  let hash2 = chainInner(seed, rest.slice(0, inner), mask);
+  hash2 = chainBorderRight(hash2, rest.slice(inner));
+  return hash2;
+}
+
+export interface ConsistencyCheck {
+  ok: boolean;
+  unreachable: boolean;
+  findings: Finding[];
+  oldSize?: number;
+  newSize?: number;
+}
+
+/**
+ * Confirm the tree `newWitness` was submitted into is a genuine append-only
+ * extension of the tree `oldWitness` was submitted into: both checkpoints
+ * are verified independently (real Ed25519ph... no — ECDSA, see above), and
+ * a real consistency proof fetched between their two tree sizes is checked
+ * to actually chain the older, already-verified root to the newer one.
+ *
+ * Deliberately does not trust `/api/v1/log/proof`'s own `rootHash` field —
+ * see the module doc for why that field cannot mean "the root at lastSize"
+ * on a log that keeps growing while the request is in flight. Only its
+ * `hashes` are used, checked against the two roots this function already
+ * verified on its own.
+ *
+ * `oldWitness` must be the chronologically earlier submission — pass them in
+ * ledger order. A same-tree-size pair (a witness compared with itself, or
+ * two anchors that landed in the same tree snapshot) is checked too: the
+ * proof must then be empty and the two roots must agree.
+ */
+export function verifyLogConsistency(oldWitness: RekorWitness, newWitness: RekorWitness, opts: { exec?: RekorExec; checkpointPublicKeyPem?: string } = {}): ConsistencyCheck {
+  const exec = opts.exec ?? defaultRekorExec;
+  const findings: Finding[] = [];
+  let unreachable = false;
+  const add = (code: string, severity: Severity, message: string) => findings.push({ code, severity, message });
+  const done = (oldSize?: number, newSize?: number): ConsistencyCheck => ({
+    ok: !unreachable && !findings.some((f) => f.severity === 'tamper'),
+    unreachable,
+    findings,
+    oldSize,
+    newSize,
+  });
+
+  if (oldWitness.rekorUrl !== newWitness.rekorUrl) {
+    add('REKOR_CONSISTENCY_DIFFERENT_LOG', 'tamper', `witnesses name different Rekor instances (${oldWitness.rekorUrl} vs ${newWitness.rekorUrl}); consistency cannot be checked across logs`);
+    return done();
+  }
+
+  // A verified checkpoint for each witness, independent of one another and
+  // of the fetch below — this is what makes it safe to ignore the
+  // consistency-proof endpoint's own claimed root.
+  const checkpointFor = (w: RekorWitness): { checkpoint?: ParsedCheckpoint; treeID?: string } => {
+    const fetched = fetchEntry(w.rekorUrl, w.uuid, exec);
+    if (!fetched.ok) {
+      if (fetched.unreachable) unreachable = true;
+      findings.push(fetched.finding);
+      return {};
+    }
+    const proof = fetched.entry.verification?.inclusionProof;
+    if (!proof?.checkpoint) {
+      add('CHECKPOINT_MISSING', 'tamper', `${w.uuid}'s inclusion proof carries no checkpoint to verify`);
+      return {};
+    }
+    const check = verifyCheckpointSignature(proof.checkpoint, opts.checkpointPublicKeyPem);
+    if (!check.ok || !check.checkpoint) {
+      findings.push(...check.findings);
+      return {};
+    }
+    if (check.checkpoint.size !== proof.treeSize || check.checkpoint.rootHash.toString('hex') !== proof.rootHash) {
+      add('CHECKPOINT_ROOT_MISMATCH', 'tamper', `${w.uuid}'s checkpoint does not attest to the same tree state its inclusion proof claims`);
+      return {};
+    }
+    // origin is "<name> - <treeID>"; the treeID is what /api/v1/log/proof needs.
+    const treeID = check.checkpoint.origin.split(' - ').pop();
+    return { checkpoint: check.checkpoint, treeID };
+  };
+
+  const older = checkpointFor(oldWitness);
+  const newer = checkpointFor(newWitness);
+  if (!older.checkpoint || !newer.checkpoint) return done();
+
+  if (older.treeID !== newer.treeID) {
+    // A real, honest possibility — Rekor rotates to a fresh shard once one
+    // fills up, and the old shard is listed forever after as `inactiveShards`
+    // in `GET /api/v1/log`, not silently dropped. That is not evidence of
+    // tampering, only that this particular check cannot run across the
+    // rotation boundary; a real Merkle consistency proof only exists within
+    // one physical tree.
+    add(
+      'REKOR_CONSISTENCY_SHARD_ROTATED',
+      'info',
+      `${oldWitness.uuid} and ${newWitness.uuid} landed in different Rekor tree shards (${older.treeID} vs ${newer.treeID}); the log rotated shards between these two submissions, so no single consistency proof spans both`,
+    );
+    return done(older.checkpoint.size, newer.checkpoint.size);
+  }
+
+  const oldSize = older.checkpoint.size;
+  const newSize = newer.checkpoint.size;
+  if (oldSize > newSize) {
+    add('REKOR_CONSISTENCY_ORDER', 'tamper', `${oldWitness.uuid} (tree size ${oldSize}) claims to be older than ${newWitness.uuid} (tree size ${newSize}), but its tree is larger — check the ledger order`);
+    return done(oldSize, newSize);
+  }
+  if (oldSize === newSize) {
+    if (!older.checkpoint.rootHash.equals(newer.checkpoint.rootHash)) {
+      add('REKOR_CONSISTENCY_PROOF_INVALID', 'tamper', `both witnesses claim tree size ${oldSize} but disagree on the root hash`);
+    }
+    return done(oldSize, newSize);
+  }
+
+  let status: number;
+  let responseBody: string;
+  try {
+    ({ status, body: responseBody } = exec('GET', `${oldWitness.rekorUrl}/api/v1/log/proof?firstSize=${oldSize}&lastSize=${newSize}&treeID=${older.treeID}`));
+  } catch (e) {
+    unreachable = true;
+    add('REKOR_CONSISTENCY_UNREACHABLE', 'warn', `could not fetch a consistency proof between sizes ${oldSize} and ${newSize}: ${(e as Error).message}`);
+    return done(oldSize, newSize);
+  }
+  if (status < 200 || status >= 300) {
+    unreachable = true;
+    add('REKOR_CONSISTENCY_UNREACHABLE', 'warn', `${oldWitness.rekorUrl} answered HTTP ${status} for the consistency proof between ${oldSize} and ${newSize}`);
+    return done(oldSize, newSize);
+  }
+
+  try {
+    const parsed = JSON.parse(responseBody) as { hashes: string[] };
+    const hashes = (parsed.hashes ?? []).map((h) => fromHex(h));
+    const calc = rootFromConsistencyProof(oldSize, newSize, hashes, older.checkpoint.rootHash);
+    if (!calc.equals(newer.checkpoint.rootHash)) {
+      add(
+        'REKOR_CONSISTENCY_PROOF_INVALID',
+        'tamper',
+        `the tree at size ${newSize} does not extend the tree at size ${oldSize}: chaining the fetched consistency proof onto the verified root at ${oldSize} gives ${toHex(calc)}, not the verified root at ${newSize} (${toHex(newer.checkpoint.rootHash)})`,
+      );
+    }
+  } catch (e) {
+    add('REKOR_CONSISTENCY_PROOF_INVALID', 'tamper', `could not recompute the consistency proof: ${(e as Error).message}`);
+  }
+
+  return done(oldSize, newSize);
 }

@@ -1,6 +1,7 @@
 /**
  * The witness ledger: a local, append-only, one-record-per-line file of every
- * witness `acta anchor --github` has ever been handed back.
+ * witness `acta anchor --github` or `acta anchor --rekor` has ever been
+ * handed back.
  *
  * Why it exists. A GitHub witness is a commit SHA. The party who can push to
  * the witness repository can also force-push it, and once the discarded commit
@@ -13,9 +14,21 @@
  *   - append to it, and refuse to do anything else to it (`appendWitness`);
  *   - copy it somewhere else the user controls, and refuse to overwrite a copy
  *     that knows something this one does not (`backupWitnessLedger`);
- *   - check every record against GitHub, and tell "GitHub says this is gone"
- *     (tamper) apart from "GitHub did not answer" (not tamper)
- *     (`verifyWitnessLedger`).
+ *   - check every record against its provider, and tell "the provider says
+ *     this is gone" (tamper) apart from "the provider did not answer" (not
+ *     tamper) (`verifyWitnessLedger`).
+ *
+ * **Rekor witnesses, and cross-submission consistency — added 2026-09-23.**
+ * A Rekor witness does not have GitHub's mutable-branch problem — Rekor has
+ * no equivalent of a force-push a caller can ask for — but it has its own:
+ * `verifyRekorWitness` checks one submission at a time against Rekor's own,
+ * now checkpoint-verified, word for its own history. Two witnesses recorded
+ * here from the same log, in the order they were filed, are exactly what a
+ * real RFC 6962 consistency proof needs: `verifyWitnessLedger` now runs
+ * `verifyLogConsistency` (`src/rekor-anchor.ts`) between each consecutive
+ * pair of Rekor records it holds, in ledger order, so a log that answers
+ * every single-entry check honestly but quietly rewrites history *between*
+ * two of a caller's own submissions is still caught.
  *
  * What it cannot do is written in the README and worth repeating here: a
  * rewrite that happens before the first backup leaves nothing to compare, and
@@ -34,6 +47,7 @@ import {
   type GhExec,
   type GitHubWitness,
 } from './github-anchor.ts';
+import { verifyRekorWitness, verifyLogConsistency, type RekorExec, type RekorWitness } from './rekor-anchor.ts';
 
 export const WITNESS_LEDGER_FILE = 'witnesses.jsonl';
 
@@ -49,13 +63,35 @@ export class WitnessLedgerError extends Error {
 
 const HEX64 = /^[0-9a-f]{64}$/;
 
-/**
- * A ledger line is exactly a `GitHubWitness`: repo, branch, path, commit SHA,
- * commit timestamp, line number, and the anchor (which carries the session id
- * and the ledger-head digest). Nothing is stored twice, so nothing can
- * disagree with itself.
- */
-export function parseWitnessRecord(line: string): GitHubWitness | undefined {
+/** A ledger line is one of the two witness shapes this project produces. Nothing is stored twice, so nothing can disagree with itself. */
+export type StoredWitness = GitHubWitness | RekorWitness;
+
+function parseAnchor(a: any): GitHubWitness['anchor'] | undefined {
+  const str = (v: unknown) => typeof v === 'string' && v.length > 0;
+  if (!a || !str(a.session) || !Number.isInteger(a.seq) || typeof a.hash !== 'string' || !HEX64.test(a.hash) || typeof a.at !== 'string') return undefined;
+  return { session: a.session, seq: a.seq, hash: a.hash, at: a.at };
+}
+
+function parseGitHubWitness(o: any): GitHubWitness | undefined {
+  const str = (v: unknown) => typeof v === 'string' && v.length > 0;
+  if (!str(o.repo) || !str(o.branch) || !str(o.path) || !str(o.commitSha) || typeof o.committedAt !== 'string') return undefined;
+  if (!Number.isInteger(o.line) || o.line < 0) return undefined;
+  const anchor = parseAnchor(o.anchor);
+  if (!anchor) return undefined;
+  return { provider: 'github', repo: o.repo, branch: o.branch, path: o.path, commitSha: o.commitSha, committedAt: o.committedAt, line: o.line, anchor };
+}
+
+function parseRekorWitness(o: any): RekorWitness | undefined {
+  const str = (v: unknown) => typeof v === 'string' && v.length > 0;
+  if (!str(o.rekorUrl) || !str(o.uuid) || !str(o.logID) || !str(o.publicKeyHex)) return undefined;
+  if (!Number.isInteger(o.logIndex) || !Number.isInteger(o.integratedTime)) return undefined;
+  const anchor = parseAnchor(o.anchor);
+  if (!anchor) return undefined;
+  return { provider: 'rekor', rekorUrl: o.rekorUrl, uuid: o.uuid, logIndex: o.logIndex, logID: o.logID, integratedTime: o.integratedTime, publicKeyHex: o.publicKeyHex, anchor };
+}
+
+/** A ledger line is a `GitHubWitness` (repo, branch, path, commit SHA, commit timestamp, line number) or a `RekorWitness` (rekorUrl, uuid, logIndex, logID, integratedTime, publicKeyHex) — always plus the anchor (session id and ledger-head digest) it witnesses. */
+export function parseWitnessRecord(line: string): StoredWitness | undefined {
   let o: any;
   try {
     o = JSON.parse(line);
@@ -63,28 +99,16 @@ export function parseWitnessRecord(line: string): GitHubWitness | undefined {
     return undefined;
   }
   if (!o || typeof o !== 'object') return undefined;
-  const str = (v: unknown) => typeof v === 'string' && v.length > 0;
-  if (o.provider !== 'github' || !str(o.repo) || !str(o.branch) || !str(o.path) || !str(o.commitSha) || typeof o.committedAt !== 'string') return undefined;
-  if (!Number.isInteger(o.line) || o.line < 0) return undefined;
-  const a = o.anchor;
-  if (!a || !str(a.session) || !Number.isInteger(a.seq) || typeof a.hash !== 'string' || !HEX64.test(a.hash) || typeof a.at !== 'string') return undefined;
-  return {
-    provider: 'github',
-    repo: o.repo,
-    branch: o.branch,
-    path: o.path,
-    commitSha: o.commitSha,
-    committedAt: o.committedAt,
-    line: o.line,
-    anchor: { session: a.session, seq: a.seq, hash: a.hash, at: a.at },
-  };
+  if (o.provider === 'github') return parseGitHubWitness(o);
+  if (o.provider === 'rekor') return parseRekorWitness(o);
+  return undefined;
 }
 
 export interface LedgerRecord {
   /** 1-based line number in the ledger file. */
   ledgerLine: number;
   raw: string;
-  witness: GitHubWitness;
+  witness: StoredWitness;
 }
 
 export interface LedgerProblem {
@@ -125,24 +149,33 @@ export function assertLedgerAppendable(path: string): void {
   }
 }
 
-const sameSpot = (a: GitHubWitness, b: GitHubWitness) => a.repo === b.repo && a.branch === b.branch && a.path === b.path && a.commitSha === b.commitSha && a.line === b.line;
+/** Two records claim the same spot in the same underlying log — the thing that makes a second, disagreeing record a conflict rather than just another entry. */
+function sameSpot(a: StoredWitness, b: StoredWitness): boolean {
+  if (a.provider !== b.provider) return false;
+  if (a.provider === 'github') return a.repo === (b as GitHubWitness).repo && a.branch === (b as GitHubWitness).branch && a.path === (b as GitHubWitness).path && a.commitSha === (b as GitHubWitness).commitSha && a.line === (b as GitHubWitness).line;
+  return a.rekorUrl === (b as RekorWitness).rekorUrl && a.uuid === (b as RekorWitness).uuid;
+}
+
+function describeSpot(w: StoredWitness): string {
+  return w.provider === 'github' ? `${w.repo}@${w.commitSha.slice(0, 12)} line ${w.line}` : `${w.rekorUrl} ${w.uuid}`;
+}
 
 /**
  * Append one witness. Append-only is enforced here, like the remote log's is:
  * the file is only ever opened for append, a damaged ledger is refused rather
  * than extended, and the bytes that were there before are read back afterwards
  * and must still be there. The same record twice is a no-op; a *different*
- * record claiming the same commit and line is refused, because one of the two
- * is wrong and the ledger will not choose.
+ * record claiming the same spot is refused, because one of the two is wrong
+ * and the ledger will not choose.
  */
-export function appendWitness(path: string, witness: GitHubWitness): { appended: boolean } {
+export function appendWitness(path: string, witness: StoredWitness): { appended: boolean } {
   const before = existsSync(path) ? readFileSync(path, 'utf8') : '';
   assertLedgerAppendable(path);
 
   for (const r of readWitnessLedger(path).records) {
     if (!sameSpot(r.witness, witness)) continue;
     if (JSON.stringify(r.witness) === JSON.stringify(witness)) return { appended: false };
-    throw new WitnessLedgerError('LEDGER_CONFLICT', `${path} already holds a different record for ${witness.repo}@${witness.commitSha.slice(0, 12)} line ${witness.line}; refusing to add a second, disagreeing one`);
+    throw new WitnessLedgerError('LEDGER_CONFLICT', `${path} already holds a different record for ${describeSpot(witness)}; refusing to add a second, disagreeing one`);
   }
 
   const line = JSON.stringify(witness) + '\n';
@@ -298,7 +331,7 @@ export type WitnessVerdict = 'clean' | 'tampered' | 'unreachable' | 'empty';
 
 export interface WitnessRecordResult {
   ledgerLine: number;
-  witness: GitHubWitness;
+  witness: StoredWitness;
   /** `OK`, or the code of the most serious finding. */
   status: string;
   findings: Finding[];
@@ -321,27 +354,80 @@ function firstDifference(head: string[], base: string[]): string | undefined {
   return undefined;
 }
 
+/** Per-record check for a GitHub witness — see `verifyWitnessLedger`'s doc for the three questions this answers. */
+function checkGitHubRecord(w: GitHubWitness, ghExec: GhExec | undefined, heads: Map<string, Head>): Finding[] {
+  const check = verifyGitHubWitness(w, { ghExec });
+  const findings: Finding[] = check.findings.map((f) =>
+    f.code === 'WITNESS_COMMIT_NOT_FOUND'
+      ? {
+          code: 'WITNESS_REWRITTEN',
+          severity: 'tamper' as const,
+          message:
+            `your ledger records commit ${w.commitSha} as pushed to ${w.repo}@${w.branch} at ${w.committedAt}, and GitHub can no longer produce it. ` +
+            `It existed, so it was discarded: the branch was force-pushed or the repository was replaced. (${f.message})`,
+        }
+      : f,
+  );
+
+  const key = `${w.repo}@${w.branch}:${w.path}`;
+  let head = heads.get(key);
+  if (!head) {
+    try {
+      const file = readGitHubFile(w.repo, w.branch, w.path, ghExec);
+      head = file ? { lines: nonEmptyLines(file.raw) } : { absent: true };
+    } catch (e) {
+      head = { unreachable: (e as Error).message.trim() };
+    }
+    heads.set(key, head);
+  }
+
+  if ('unreachable' in head) {
+    if (!check.unreachable) findings.push({ code: 'WITNESS_UNREACHABLE', severity: 'warn', message: `could not read ${w.path} at the head of ${w.repo}@${w.branch}: ${head.unreachable}` });
+  } else if ('absent' in head) {
+    findings.push({ code: 'LOG_PREFIX_CHANGED', severity: 'tamper', message: `${w.repo}@${w.branch} no longer has ${w.path} at its head; the log this record was written into is gone` });
+  } else if (check.lines) {
+    const why = firstDifference(head.lines, check.lines);
+    if (why) findings.push({ code: 'LOG_PREFIX_CHANGED', severity: 'tamper', message: `the head of ${w.repo}@${w.branch} no longer begins with the log as this witness saw it: ${why}` });
+  } else if (findings.some((f) => f.code === 'WITNESS_REWRITTEN')) {
+    // The commit is gone; all the ledger can still ask is whether the head kept the anchor.
+    if (head.lines[w.line] === formatAnchor(w.anchor)) {
+      findings.push({ code: 'HEAD_STILL_HOLDS_ANCHOR', severity: 'info', message: `the head of ${w.repo}@${w.branch} still has this anchor on line ${w.line}; the history around it was rewritten, the anchor itself survived` });
+    } else {
+      findings.push({ code: 'LOG_PREFIX_CHANGED', severity: 'tamper', message: `the head of ${w.repo}@${w.branch} does not have this anchor on line ${w.line} either; it is gone from the log, not only from history` });
+    }
+  }
+  return findings;
+}
+
+export interface VerifyWitnessLedgerOptions {
+  ghExec?: GhExec;
+  rekorExec?: RekorExec;
+  /** Override the key `verifyRekorWitness`/`verifyLogConsistency` check checkpoints against — tests only; production always uses the real rekor.sigstore.dev key. */
+  rekorCheckpointPublicKeyPem?: string;
+}
+
 /**
- * Check every record in the ledger against GitHub.
+ * Check every record in the ledger against the provider it names.
  *
- * Per record, three questions, all answered by GitHub and none by the ledger:
+ * A GitHub record answers three questions, all from GitHub, none from the
+ * ledger: is the commit still fetchable by SHA (`WITNESS_REWRITTEN` if not —
+ * the ledger is the proof it once existed); does the branch head still begin
+ * with the log as this witness saw it (`LOG_PREFIX_CHANGED`); could GitHub be
+ * asked at all (`WITNESS_UNREACHABLE`, never tamper on its own).
  *
- *   1. Is the commit still there, with that timestamp, holding that anchor on
- *      that line? (`verifyGitHubWitness`, by SHA.) If GitHub says the commit is
- *      gone, that is `WITNESS_REWRITTEN` — not "not found", because the ledger
- *      is the proof it once was.
- *   2. Does the branch head still begin with exactly the lines the file had at
- *      that commit? If not, `LOG_PREFIX_CHANGED`: history was rewritten even if
- *      the old commit can still be fetched. If the commit is gone, the fallback
- *      is the one thing the ledger knows: the anchor should still be on its
- *      line at the head.
- *   3. Could GitHub be asked at all? If not, `WITNESS_UNREACHABLE` — reported,
- *      and never counted as tamper.
+ * A Rekor record is checked with `verifyRekorWitness` (checkpoint-signature
+ * verified, inclusion proof recomputed against that verified root). Two or
+ * more Rekor records in the same ledger get one more check `verifyGitHubWitness`
+ * has no equivalent of: `verifyLogConsistency` between each consecutive pair,
+ * in the order they were filed, so a log that answers every single-entry
+ * check honestly but rewrites history *between* two of a caller's own
+ * submissions does not pass unnoticed — its findings are attached to the
+ * later record of the pair.
  *
  * Tamper anywhere outranks an unreachable record in the verdict: one record
- * that GitHub disowns is a finding no network failure elsewhere can dilute.
+ * its provider disowns is a finding no network failure elsewhere can dilute.
  */
-export function verifyWitnessLedger(ledgerPath: string, opts: { ghExec?: GhExec } = {}): WitnessLedgerReport {
+export function verifyWitnessLedger(ledgerPath: string, opts: VerifyWitnessLedgerOptions = {}): WitnessLedgerReport {
   const ledger = readWitnessLedger(ledgerPath);
   const ledgerFindings: Finding[] = ledger.problems.map((p) => ({
     code: 'WITNESS_LEDGER_MALFORMED',
@@ -350,55 +436,33 @@ export function verifyWitnessLedger(ledgerPath: string, opts: { ghExec?: GhExec 
   }));
 
   const heads = new Map<string, Head>();
-  const headOf = (w: GitHubWitness): Head => {
-    const key = `${w.repo}@${w.branch}:${w.path}`;
-    let h = heads.get(key);
-    if (!h) {
-      try {
-        const file = readGitHubFile(w.repo, w.branch, w.path, opts.ghExec);
-        h = file ? { lines: nonEmptyLines(file.raw) } : { absent: true };
-      } catch (e) {
-        h = { unreachable: (e as Error).message.trim() };
-      }
-      heads.set(key, h);
-    }
-    return h;
-  };
-
-  const records: WitnessRecordResult[] = ledger.records.map(({ ledgerLine, witness: w }) => {
-    const check = verifyGitHubWitness(w, { ghExec: opts.ghExec });
-    const findings: Finding[] = check.findings.map((f) =>
-      f.code === 'WITNESS_COMMIT_NOT_FOUND'
-        ? {
-            code: 'WITNESS_REWRITTEN',
-            severity: 'tamper' as const,
-            message:
-              `your ledger records commit ${w.commitSha} as pushed to ${w.repo}@${w.branch} at ${w.committedAt}, and GitHub can no longer produce it. ` +
-              `It existed, so it was discarded: the branch was force-pushed or the repository was replaced. (${f.message})`,
-          }
-        : f,
+  const findingsByLine = new Map<number, Finding[]>();
+  for (const { ledgerLine, witness } of ledger.records) {
+    findingsByLine.set(
+      ledgerLine,
+      witness.provider === 'github' ? checkGitHubRecord(witness, opts.ghExec, heads) : verifyRekorWitness(witness, { exec: opts.rekorExec, checkpointPublicKeyPem: opts.rekorCheckpointPublicKeyPem }).findings,
     );
+  }
 
-    const head = headOf(w);
-    if ('unreachable' in head) {
-      if (!check.unreachable) findings.push({ code: 'WITNESS_UNREACHABLE', severity: 'warn', message: `could not read ${w.path} at the head of ${w.repo}@${w.branch}: ${head.unreachable}` });
-    } else if ('absent' in head) {
-      findings.push({ code: 'LOG_PREFIX_CHANGED', severity: 'tamper', message: `${w.repo}@${w.branch} no longer has ${w.path} at its head; the log this record was written into is gone` });
-    } else if (check.lines) {
-      const why = firstDifference(head.lines, check.lines);
-      if (why) findings.push({ code: 'LOG_PREFIX_CHANGED', severity: 'tamper', message: `the head of ${w.repo}@${w.branch} no longer begins with the log as this witness saw it: ${why}` });
-    } else if (findings.some((f) => f.code === 'WITNESS_REWRITTEN')) {
-      // The commit is gone; all the ledger can still ask is whether the head kept the anchor.
-      if (head.lines[w.line] === formatAnchor(w.anchor)) {
-        findings.push({ code: 'HEAD_STILL_HOLDS_ANCHOR', severity: 'info', message: `the head of ${w.repo}@${w.branch} still has this anchor on line ${w.line}; the history around it was rewritten, the anchor itself survived` });
-      } else {
-        findings.push({ code: 'LOG_PREFIX_CHANGED', severity: 'tamper', message: `the head of ${w.repo}@${w.branch} does not have this anchor on line ${w.line} either; it is gone from the log, not only from history` });
-      }
-    }
+  // Cross-submission consistency: every consecutive pair of Rekor records,
+  // in the order the ledger holds them (append-only, so that is filing
+  // order — the ledger's own chronological order).
+  const rekorRecords = ledger.records.filter((r): r is LedgerRecord & { witness: RekorWitness } => r.witness.provider === 'rekor');
+  for (let i = 1; i < rekorRecords.length; i++) {
+    const consistency = verifyLogConsistency(rekorRecords[i - 1].witness, rekorRecords[i].witness, { exec: opts.rekorExec, checkpointPublicKeyPem: opts.rekorCheckpointPublicKeyPem });
+    const line = rekorRecords[i].ledgerLine;
+    findingsByLine.set(line, [...(findingsByLine.get(line) ?? []), ...consistency.findings]);
+  }
 
+  // Status stays the single marker 'WITNESS_UNREACHABLE' regardless of which
+  // provider's own finding code (WITNESS_UNREACHABLE, REKOR_UNREACHABLE,
+  // REKOR_CONSISTENCY_UNREACHABLE) produced it — everything downstream
+  // (the CLI, the exit-code logic) only ever needs "reachable or not".
+  const records: WitnessRecordResult[] = ledger.records.map(({ ledgerLine, witness }) => {
+    const findings = findingsByLine.get(ledgerLine) ?? [];
     const firstTamper = findings.find((f) => f.severity === 'tamper');
-    const unreachable = findings.some((f) => f.code === 'WITNESS_UNREACHABLE');
-    return { ledgerLine, witness: w, status: firstTamper?.code ?? (unreachable ? 'WITNESS_UNREACHABLE' : 'OK'), findings };
+    const isUnreachable = !firstTamper && findings.some((f) => f.severity === 'warn');
+    return { ledgerLine, witness, status: firstTamper?.code ?? (isUnreachable ? 'WITNESS_UNREACHABLE' : 'OK'), findings };
   });
 
   const tampered = ledgerFindings.length > 0 || records.some((r) => r.findings.some((f) => f.severity === 'tamper'));

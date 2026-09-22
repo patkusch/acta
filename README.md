@@ -308,18 +308,18 @@ host's own log.
 ```
 acta init   [dir]                                   create a ledger directory and key pair
 acta verify [dir] [--key pem] [--anchors file] [--git] [--witness file] [--strict] [--json]
-acta anchor [dir] [--to file] [--append-to file] [--git] [--github owner/name[:branch] [--github-path file] [--witness-out file] [--witness-ledger file]]
+acta anchor [dir] [--to file] [--append-to file] [--git] [--github owner/name[:branch] [--github-path file]] [--rekor [--rekor-url url]] [--witness-out file] [--witness-ledger file]
 acta witness backup [witnesses.jsonl | dir] --to <path | owner/name[:branch]> [--backup-path file]
-acta witness add witness.json [--ledger file]        file an older witness.json once GitHub confirms it
-acta verify --witnesses witnesses.jsonl [--json]     check every recorded witness against GitHub
+acta witness add witness.json [--ledger file]        file an older witness.json once its provider confirms it
+acta verify --witnesses witnesses.jsonl [--json]     check every recorded witness against its provider (GitHub and/or Rekor)
 acta show   [dir]                                   print the timeline
 acta mcp    [--dir d] [--resume [--rotate-on-resume]] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]
 ```
 
 Exit codes from `verify`: 0 verified (or consistent without `--strict`),
 1 tampered, 3 consistent under `--strict`. `verify --witnesses` uses 0 clean,
-1 tampered, 2 GitHub could not be reached (not a finding), 3 the ledger is
-empty.
+1 tampered, 2 the provider could not be reached (not a finding), 3 the ledger
+is empty.
 
 ### Binding calls to definitions
 
@@ -489,6 +489,13 @@ the ledger-head digest). The file only ever grows. acta refuses to add to a
 damaged one, checks after each write that the earlier bytes are still there,
 and stops *before* pushing anything if the ledger is not in a state to be
 written to.
+
+`acta anchor --rekor` writes to the same ledger, in the same file, as its own
+kind of line (rekorUrl, uuid, logIndex, logID, integratedTime, public key,
+anchor) — a ledger can hold either kind, or both. `verify --witnesses` checks
+each line the way its provider needs: GitHub lines the way this section
+describes, Rekor lines by [`verifyRekorWitness` and, between consecutive
+Rekor lines, `verifyLogConsistency`](#cross-submission-log-consistency).
 
 ```
 acta witness backup .acta --to /Volumes/usb/witnesses.jsonl   # a folder you control
@@ -753,6 +760,103 @@ verifyRekorWitness(witness).ok  // re-fetches by uuid; verifies the bundled chec
 | `REKOR_INCLUSION_PROOF_MISSING`, `REKOR_INCLUSION_PROOF_INVALID` | tamper | no inclusion proof was returned, or it does not recompute to the checkpoint-verified root |
 | `REKOR_UNREACHABLE` | warn | Rekor did not answer (network, rate limit) — never a pass, never tamper on its own |
 
+### Cross-submission log consistency
+
+One verified checkpoint proves an entry existed at some tree state. It says
+nothing about whether *later* tree states Rekor shows are honest extensions
+of that one — a log could answer every single-entry check honestly and still
+quietly rewrite history between two of a caller's own submissions.
+`verifyLogConsistency(oldWitness, newWitness)` checks two Rekor witnesses
+against each other: both checkpoints verified independently first (the same
+`verifyCheckpointSignature` as above), then a real RFC 6962 consistency
+proof — ported from and checked against `transparency-dev/merkle`'s
+`proof.go`, the same source the inclusion-proof math came from, and
+cross-checked against 1,640 cases from an independent, textbook RFC 6962
+reference implementation in `test/fake-rekor.ts` — confirms the newer tree
+is a genuine append-only extension of the older one.
+
+**One more real thing had to be checked, not assumed, before trusting this**:
+`GET /api/v1/log/proof`'s own `rootHash` field cannot be read as "the root at
+`lastSize`". Requesting the exact same `(firstSize, lastSize, treeID)` three
+times in a row against the live active shard came back with the `hashes`
+array — the actual consistency proof — byte-for-byte identical every time,
+but a *different* `rootHash` every single time. Reading Trillian's semantics
+explains why: that field reports the tree's root as of the moment of the
+request, not as of `lastSize` on a log that is still growing while the
+request is in flight — harmless for Rekor's own reference client
+(`pkg/verify/verify.go`'s `ProveConsistency`), which never reads that field
+either. `verifyLogConsistency` does the same: it ignores it and checks the
+fetched consistency proof against two independently checkpoint-verified
+roots instead.
+
+**The real proof, done for real, on 2026-09-23** — one more small, real
+submission, the same shape as the 2026-09-22 one:
+
+```
+uuid:            108e9186e8c5677a44cfbc804becc228558950e667aea72983158dfc4072c19290721684fbd86def
+logIndex:        2909594846
+logID:           c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d
+integratedTime:  1790085857  (2026-09-22T14:04:17Z)
+verifyRekorWitness(newWitness).ok → true, findings: []
+
+verifyLogConsistency(oldWitness /* 2026-09-22, uuid 108e9186…f481ac6665ffeb67f */, newWitness).ok → true
+  oldSize: 2787690595   (the log's size when the old entry's checkpoint was re-fetched just now)
+  newSize: 2787690599   (the log's size at the new submission)
+  findings: []
+```
+
+The old entry's own checkpoint was re-fetched fresh for this — its tree size
+is the size *at the moment of this check*, not at its original 2026-09-22
+integration, since Rekor re-issues a current checkpoint on every read of an
+existing entry. That is exactly what makes the check meaningful: two
+checkpoints taken minutes apart, both independently signature-verified, and
+a real fetched consistency proof shows the second is a genuine extension of
+the first.
+
+This closes the item [Not built](#not-built) used to name: both parts of the
+2026-09-22 gap — checkpoint-signature verification and cross-submission
+consistency — are done, checked against real `rekor.sigstore.dev` data, not
+only against the mocked fast-suite fixtures.
+
+**What this still does not prove**, stated plainly rather than folded into a
+blanket disclaimer: `verifyLogConsistency` proves the specific pair of tree
+states two witnesses name are consistent with each other. It says nothing
+about a *split-view* attack — a log that shows this caller one version of
+history and shows someone else a different, equally self-consistent one,
+never letting the two versions' consistency be checked against each other at
+all. Catching that needs gossip between independent parties (comparing
+checkpoints out of band) or a monitor watching the log continuously, neither
+of which this project runs. What this module does close is the narrower,
+concrete claim it makes: two submissions *this same caller* holds witnesses
+for are provably the same growing tree, not two different ones the log
+happened to answer identically for that one caller.
+
+```ts
+import { verifyLogConsistency } from './src/rekor-anchor.ts';
+
+verifyLogConsistency(oldWitness, newWitness).ok  // both checkpoints verified independently; a real consistency proof confirms newWitness's tree genuinely extends oldWitness's
+```
+
+| finding | severity | meaning |
+|:--|:--|:--|
+| `REKOR_CONSISTENCY_DIFFERENT_LOG` | tamper | the two witnesses name different Rekor instances (`rekorUrl`); consistency cannot be checked across logs |
+| `REKOR_CONSISTENCY_ORDER` | tamper | the "older" witness's tree is actually larger than the "newer" one's — check the call order |
+| `REKOR_CONSISTENCY_PROOF_INVALID` | tamper | the fetched consistency proof does not chain the older verified root to the newer one: the newer tree is not a real extension of the older one |
+| `REKOR_CONSISTENCY_SHARD_ROTATED` | info | the two submissions landed in different physical tree shards (Rekor rotates once a shard fills, and lists retired ones in `GET /api/v1/log`) — not tamper, just nothing a single consistency proof can span |
+| `REKOR_CONSISTENCY_UNREACHABLE` | warn | the consistency-proof endpoint did not answer — never a pass, never tamper on its own |
+| (any `CHECKPOINT_*` or `REKOR_*` code above) | — | either witness's own checkpoint failed to verify; reported the same way it is for a single witness |
+
+**Wired into the witness ledger.** `acta anchor --rekor [--rekor-url url]`
+submits and files a `RekorWitness` in the same `witnesses.jsonl` the GitHub
+sink uses (`--github` and `--rekor` witnesses can share one ledger).
+`acta verify --witnesses` now runs `verifyLogConsistency` between every
+consecutive pair of Rekor records it finds, in the order they were filed —
+the ledger's own chronological order, since it is append-only — attaching
+any finding to the later record of the pair. See [the witness
+ledger](#the-witness-ledger) and `test/witness-ledger.test.ts`'s "Rekor
+witnesses" section for the mocked coverage (a shared fake growing log with
+real RFC 6962 proofs, in `test/fake-rekor.ts`).
+
 ## Findings reference
 
 | code | severity | meaning |
@@ -813,21 +917,18 @@ on its own, whatever the ledger's own verdict says.
 
 ## Not built
 
-- **Log-consistency verification across repeated Rekor submissions.**
-  [Checkpoint-signature verification closed 2026-09-23](#a-public-transparency-log-witness-rekor):
-  `verifyRekorWitness` no longer trusts the root hash an inclusion proof
-  merely asserts, it verifies the ECDSA signature Rekor actually published
-  over that root first. What is left: each `verifyRekorWitness` call still
-  checks one submission at a time, the way the Rekor sink did before the
-  [witness ledger](#the-witness-ledger) gave the GitHub sink cross-submission
-  checking. A dishonest log that publishes two genuinely, independently
-  signed checkpoints — one for each of two submissions — but where the later
-  one is not actually a real append-only extension of the earlier one, would
-  not yet be caught. Closing this needs a real RFC 6962 consistency proof
-  between the two tree states (`transparency-dev/merkle`'s `proof.go` has
-  the algorithm alongside the inclusion-proof one already ported) and
-  something to fetch or accept two checkpoints to check it against. Dated
-  2026-09-22, narrowed 2026-09-23.
+Nothing. The last item here — [checkpoint-signature verification and
+cross-submission log consistency for the Rekor
+witness](#cross-submission-log-consistency) — closed for real on
+2026-09-23, both halves checked against real `rekor.sigstore.dev` data: a
+real checkpoint fetched and its ECDSA signature verified, and a real
+consistency proof checked between two real submissions. What each piece of
+this design still cannot do is stated in place, next to the piece itself —
+[the twelfth attack](#the-attack-table), [what append-only does and does
+not defend](#an-append-only-anchor-sink), [the honest limit of a GitHub
+witness](#a-public-anchor-witness), [what a Rekor witness still rests
+on](#cross-submission-log-consistency) — rather than collected into a
+blanket disclaimer here.
 
 ## License
 

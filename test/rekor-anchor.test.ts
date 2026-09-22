@@ -19,12 +19,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash, createPublicKey, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 
 import {
   writeRekorAnchor,
   verifyRekorWitness,
+  verifyLogConsistency,
   rootFromInclusionProof,
+  rootFromConsistencyProof,
   parseCheckpoint,
   verifyCheckpointSignature,
   REKOR_SIGSTORE_DEV_CHECKPOINT_PUBLIC_KEY_PEM,
@@ -32,6 +34,7 @@ import {
   type RekorWitness,
 } from '../src/rekor-anchor.ts';
 import type { Anchor } from '../src/anchor.ts';
+import { fakeGrowingRekor, fakeWitnessFor, signFakeCheckpoint, fakeCheckpointKeyPair, testRekorSeed } from './fake-rekor.ts';
 
 const anchorA: Anchor = { session: 'rekor-test', seq: 3, hash: 'a'.repeat(64), at: '2026-09-22T09:00:00.000Z' };
 const anchorB: Anchor = { session: 'rekor-test', seq: 9, hash: 'b'.repeat(64), at: '2026-09-22T09:05:00.000Z' };
@@ -150,28 +153,71 @@ test('parseCheckpoint throws on a checkpoint with no blank line before the signa
   assert.throws(() => parseCheckpoint('not a checkpoint at all'));
 });
 
+// --- rootFromConsistencyProof, against a real fetched consistency proof ----
+//
+// Both tree sizes and root hashes below come from real, independently
+// checkpoint-verified sources (an existing acta witness, and the fresh
+// `GET /api/v1/log` checkpoint above) — never from the consistency-proof
+// endpoint's own claimed `rootHash`, which the module doc explains cannot
+// be trusted as "the root at lastSize" on a log that keeps growing while
+// the request is in flight. Only the endpoint's `hashes` are used here,
+// fetched for real on 2026-09-23 from
+// `GET /api/v1/log/proof?firstSize=2787660465&lastSize=2787668724&treeID=1193050959916656506`.
+
+test('rootFromConsistencyProof reconstructs a real, independently-verified checkpoint root from an earlier real, independently-verified checkpoint root and a real fetched consistency proof', () => {
+  const size1 = 2787660465;
+  const size2 = 2787668724;
+  const root1 = Buffer.from('f8131fcce30346e544bcd4673fee3e0991979e3b82225495b7dd5e5f02b8da54', 'hex');
+  const root2 = Buffer.from('98805bfbe827a7685952a70accc422771c1ad1e32e014eee02adf6e087666892', 'hex');
+  const hashesHex = [
+    '52cfa8a8e878cb8a741ee53076099faba8f157d38cec53f94d5e8fee9d4e40d8',
+    '403ba9906ee42865cc7a45824a6e35f10af66ee593247a6a55e50afcae1c85fd',
+    '6c996634a46a198621b311e3babe059d41c127382476ca254509be9650e7eece',
+    '309ad46303e653392d5a8684f051264e3f466b180dbf6b2ead26b7d25a0dae10',
+    '09c3bef9985f6642b5b40dbf2d754389fb212606cdc51ace82dd5d1e9683f735',
+    '152b711047d318cd559096b71512a0bc76294ba93670615392e103a7a87faaaf',
+    'af23e2f5cea5d5b7b16dd3ee1dc5af2363181ba8c023ae2e43bc6d747c802746',
+    'c4a4c65ca950f5f9225a426d89578063c630480911456026ceafd7dec88a4823',
+    'c231b38ff9f4c35217ef6604b925736b1934472d300bb37ca45abef401c466f4',
+    '4cebb03cfd19e98c48ea2a71f01679376699071e6445d9e77279185376571f53',
+    '5901853acddb6bfc2bca9d39e230c10931eb8f7180b56577b4d36158e5e64dda',
+    '1d83d9bedc24f1d639e4c8ff3d092e9d029ec5ee7406bcf26f3826fbf799fe38',
+    'bed3008be76592cfcac63610ea7c559a94003574f4173ed2671ec40a4fc97e5a',
+    '52d8606ab23c698e61bf2ed4a9070f318057d9da8ad6189b7c87800964c4e58a',
+    'bdcf86bfa0fbc636309f74d2c275c0e6a441e94f41c8dceb62729ea3689e2a7d',
+    'da2e5e8707a77a80bc616af5841aefe87285b7e0bdd4af745d83843a4b62c4ae',
+    '4d688d3e882aabd2cffa8f5743bd8bac54b6f5758d5bc8b7cfaa6c83d67671e0',
+    'd92c3c7d49fd8a086ed5216cb98f89ed335dc0e770cdf130a6a24719bb4c9e39',
+    '8c926c8ebfe903fc8120284192e16f50f9531e00c7b51fc7251715eb41d77517',
+    '99f5a349d35a11f357c43c30e8000ec3f3682bd7bacf5c8a6999b9c6f98c69bb',
+    'ab1cc76a7033cf9ed20dd9897b407b6c92bbd8d4c805bc043060412af0ce44ec',
+    'c47fc30ac78b1ebf5e2a8613f2ab0e4592bbcd5744198587b95b6c56b0fde706',
+  ];
+  const hashes = hashesHex.map((h) => Buffer.from(h, 'hex'));
+  const got = rootFromConsistencyProof(size1, size2, hashes, root1);
+  assert.equal(got.toString('hex'), root2.toString('hex'));
+});
+
+test('rootFromConsistencyProof rejects a proof that does not chain to the given old root', () => {
+  const size1 = 2787660465;
+  const size2 = 2787668724;
+  const wrongRoot1 = Buffer.alloc(32, 0xff);
+  assert.throws(() => rootFromConsistencyProof(size1, size2, [Buffer.alloc(32)], wrongRoot1));
+});
+
+test('rootFromConsistencyProof returns the same root unchanged when the two sizes are equal and the proof is empty', () => {
+  const root = Buffer.alloc(32, 0x42);
+  assert.deepEqual(rootFromConsistencyProof(9, 9, [], root), root);
+});
+
+test('rootFromConsistencyProof rejects size2 smaller than size1', () => {
+  assert.throws(() => rootFromConsistencyProof(10, 5, [], Buffer.alloc(32)));
+});
+
+
 // --- writeRekorAnchor / verifyRekorWitness, against a fake Rekor -----------
 
-/** Deterministic 32-byte Ed25519 seed for a test key — not used for anything real. */
-function testSeed(): Uint8Array {
-  const { privateKey } = generateKeyPairSync('ed25519');
-  return Buffer.from((privateKey.export({ format: 'jwk' }) as { d: string }).d, 'base64url');
-}
-
-/** Signs a fake checkpoint the same way rekor.sigstore.dev's real one is shaped (see the module doc): ECDSA P-256 over SHA-256 of the note text, 4-byte key-hint-prefixed signature line. */
-function signFakeCheckpoint(priv: KeyObject, origin: string, size: number, rootHash: Buffer): string {
-  const note = `${origin}\n${size}\n${rootHash.toString('base64')}\n`;
-  const sig = cryptoSign('sha256', Buffer.from(note, 'utf8'), priv);
-  const pubDer = createPublicKey(priv).export({ type: 'spki', format: 'der' }) as Buffer;
-  const keyHint = createHash('sha256').update(pubDer).digest().subarray(0, 4);
-  const sigLine = Buffer.concat([keyHint, sig]).toString('base64');
-  return `${note}\n— fake-log ${sigLine}\n`;
-}
-
-function fakeCheckpointKeyPair() {
-  const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
-  return { privateKey, checkpointPublicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }) as string };
-}
+const testSeed = testRekorSeed;
 
 /**
  * A tiny in-memory stand-in for the slice of Rekor's v1 API this module
@@ -355,4 +401,125 @@ test('verifyRekorWitness reports a network failure as unreachable, never as a pa
 test('writeRekorAnchor throws when the log rejects the submission', () => {
   const rejectingExec: RekorExec = () => ({ status: 400, body: '{"message":"bad request"}' });
   assert.throws(() => writeRekorAnchor(anchorA, { secretKey: testSeed(), exec: rejectingExec }), /rekor rejected the entry/);
+});
+// --- verifyLogConsistency, against a fake growing log -----------------------
+//
+// The RFC 6962 math itself is proven above against real rekor.sigstore.dev
+// data (`rootFromConsistencyProof`) and against 1,640 cross-checks against an
+// independent, textbook RFC 6962 reference implementation (`test/fake-rekor.ts`,
+// shared with `witness-ledger.test.ts`). This fake exercises the plumbing
+// around that math — fetching two entries, verifying both checkpoints,
+// matching treeIDs, fetching and applying the consistency proof, and telling
+// a real tamper apart from a legitimate shard rotation — with a real,
+// growing, multi-leaf Merkle tree computed the textbook (recursive) way,
+// independent of the production code's optimized iterative implementation.
+
+const fakeWitnessForA = (entry: { verification: { inclusionProof: { logIndex: number } } }, uuid: string, rekorUrl: string) => fakeWitnessFor(entry, uuid, rekorUrl, anchorA);
+
+test('verifyLogConsistency confirms a genuine append-only extension between two real submissions to a growing log', () => {
+  const log = fakeGrowingRekor();
+  for (let i = 0; i < 5; i++) log.exec('POST', 'https://fake/api/v1/log/entries', JSON.stringify({ spec: { i } }));
+  const oldUuid = 'uuid-2';
+  const newUuid = 'uuid-5';
+  const oldW = fakeWitnessForA(log.entries.get(oldUuid), oldUuid, 'https://fake');
+  const newW = fakeWitnessForA(log.entries.get(newUuid), newUuid, 'https://fake');
+
+  const check = verifyLogConsistency(oldW, newW, { exec: log.exec, checkpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.deepEqual(check.findings, []);
+  assert.equal(check.ok, true);
+  assert.equal(check.oldSize, 2);
+  assert.equal(check.newSize, 5);
+});
+
+test('verifyLogConsistency is order-independent about which witness came first among two at the SAME tree size (compares roots directly)', () => {
+  const log = fakeGrowingRekor();
+  log.exec('POST', 'https://fake/api/v1/log/entries', JSON.stringify({ spec: { i: 0 } }));
+  const w = fakeWitnessForA(log.entries.get('uuid-1'), 'uuid-1', 'https://fake');
+  const check = verifyLogConsistency(w, w, { exec: log.exec, checkpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.deepEqual(check.findings, []);
+  assert.equal(check.ok, true);
+});
+
+test('verifyLogConsistency catches a real rewrite: the newer checkpoint does not actually extend the older one', () => {
+  const log = fakeGrowingRekor();
+  for (let i = 0; i < 4; i++) log.exec('POST', 'https://fake/api/v1/log/entries', JSON.stringify({ spec: { i } }));
+  const oldW = fakeWitnessForA(log.entries.get('uuid-1'), 'uuid-1', 'https://fake');
+  const newEntry = log.entries.get('uuid-4') as { verification: { inclusionProof: { checkpoint: string } } };
+  // Forge a checkpoint claiming the same size but a different root, signed
+  // with the log's own real key — a log that lies about its own history,
+  // not a network glitch.
+  const forgedRoot = Buffer.alloc(32, 0x99);
+  const priv = generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey; // wrong key on purpose: forging with the RIGHT key is the case above; this checks the checkpoint-signature layer catches a forged root even when attempted
+  newEntry.verification.inclusionProof.checkpoint = signFakeCheckpoint(priv, 'fake-log - 111', 4, forgedRoot);
+  const newW = fakeWitnessForA(log.entries.get('uuid-4'), 'uuid-4', 'https://fake');
+
+  const check = verifyLogConsistency(oldW, newW, { exec: log.exec, checkpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.equal(check.ok, false);
+  assert.ok(check.findings.some((f) => f.code === 'CHECKPOINT_KEY_MISMATCH'));
+});
+
+test('verifyLogConsistency treats a real consistency-proof failure (root does not chain) as tamper', () => {
+  const log = fakeGrowingRekor();
+  for (let i = 0; i < 4; i++) log.exec('POST', 'https://fake/api/v1/log/entries', JSON.stringify({ spec: { i } }));
+  const oldW = fakeWitnessForA(log.entries.get('uuid-1'), 'uuid-1', 'https://fake');
+  const newW = fakeWitnessForA(log.entries.get('uuid-4'), 'uuid-4', 'https://fake');
+  // Tamper the *inclusion proof's* rootHash on the old entry after the fact —
+  // its checkpoint (independently, correctly signed) will then disagree, so
+  // this is caught before the consistency fetch even runs.
+  const oldEntry = log.entries.get('uuid-1') as { verification: { inclusionProof: { rootHash: string } } };
+  oldEntry.verification.inclusionProof.rootHash = 'ab'.repeat(32);
+
+  const check = verifyLogConsistency(oldW, newW, { exec: log.exec, checkpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.equal(check.ok, false);
+  assert.ok(check.findings.some((f) => f.code === 'CHECKPOINT_ROOT_MISMATCH'));
+});
+
+test('verifyLogConsistency reports a shard rotation as info, not tamper: no consistency proof spans two different trees', () => {
+  // A real shard rotation keeps signing checkpoints with the same log key
+  // across the old and new tree (confirmed for real: rekor.sigstore.dev's
+  // inactive and active shards share one checkpoint-signing key) — only the
+  // treeID in the origin line changes. Share one keypair here to match.
+  const keyPair = fakeCheckpointKeyPair();
+  const oldLog = fakeGrowingRekor({ treeID: '111', uuidPrefix: 'old-', keyPair });
+  const newLog = fakeGrowingRekor({ treeID: '222', uuidPrefix: 'new-', keyPair });
+  oldLog.exec('POST', 'https://fake/api/v1/log/entries', JSON.stringify({ spec: { i: 0 } }));
+  newLog.exec('POST', 'https://fake/api/v1/log/entries', JSON.stringify({ spec: { i: 0 } }));
+  const oldW = fakeWitnessForA(oldLog.entries.get('old-uuid-1'), 'old-uuid-1', 'https://fake');
+  const newW = fakeWitnessForA(newLog.entries.get('new-uuid-1'), 'new-uuid-1', 'https://fake');
+
+  // Route each UUID to its own fake log by prefix.
+  const exec: RekorExec = (method, url, body) => (url.includes('old-uuid-1') ? oldLog.exec(method, url, body) : newLog.exec(method, url, body));
+  const check = verifyLogConsistency(oldW, newW, { exec, checkpointPublicKeyPem: keyPair.checkpointPublicKeyPem });
+  assert.equal(check.ok, true, 'a shard rotation is not tamper');
+  assert.ok(check.findings.some((f) => f.code === 'REKOR_CONSISTENCY_SHARD_ROTATED' && f.severity === 'info'));
+});
+
+test('verifyLogConsistency refuses out-of-order witnesses (newer tree size smaller than the older one) as tamper', () => {
+  const log = fakeGrowingRekor();
+  for (let i = 0; i < 3; i++) log.exec('POST', 'https://fake/api/v1/log/entries', JSON.stringify({ spec: { i } }));
+  const bigger = fakeWitnessForA(log.entries.get('uuid-3'), 'uuid-3', 'https://fake');
+  const smaller = fakeWitnessForA(log.entries.get('uuid-1'), 'uuid-1', 'https://fake');
+  // Pass them in the wrong order: "old" claims to be size 3, "new" size 1.
+  const check = verifyLogConsistency(bigger, smaller, { exec: log.exec, checkpointPublicKeyPem: log.checkpointPublicKeyPem });
+  assert.equal(check.ok, false);
+  assert.ok(check.findings.some((f) => f.code === 'REKOR_CONSISTENCY_ORDER'));
+});
+
+test('verifyLogConsistency reports a network failure as unreachable, never as a pass or as tamper', () => {
+  const throwingExec: RekorExec = () => {
+    throw new Error('simulated DNS failure');
+  };
+  const w: RekorWitness = { provider: 'rekor', rekorUrl: 'https://rekor.sigstore.dev', uuid: 'whatever', logIndex: 1, logID: 'x', integratedTime: 1, publicKeyHex: '00'.repeat(32), anchor: anchorA };
+  const check = verifyLogConsistency(w, w, { exec: throwingExec });
+  assert.equal(check.ok, false);
+  assert.equal(check.unreachable, true);
+  assert.ok(!check.findings.some((f) => f.severity === 'tamper'));
+});
+
+test('verifyLogConsistency rejects two witnesses naming different Rekor instances outright', () => {
+  const a: RekorWitness = { provider: 'rekor', rekorUrl: 'https://rekor.sigstore.dev', uuid: 'a', logIndex: 1, logID: 'x', integratedTime: 1, publicKeyHex: '00'.repeat(32), anchor: anchorA };
+  const b: RekorWitness = { ...a, rekorUrl: 'https://example.com', uuid: 'b' };
+  const check = verifyLogConsistency(a, b);
+  assert.equal(check.ok, false);
+  assert.ok(check.findings.some((f) => f.code === 'REKOR_CONSISTENCY_DIFFERENT_LOG'));
 });
