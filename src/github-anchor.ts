@@ -1,13 +1,16 @@
 /**
  * A public GitHub repository as an anchor sink and witness.
  *
- * The blocker on a dedicated transparency log (Sigstore Rekor) is narrow but
- * real: Rekor's `hashedrekord` entry needs an Ed25519ph signature (the
- * prehashed variant, RFC 8032 §5.1.6), and Node's `node:crypto` only signs
- * pure Ed25519 (§5.1.6's PH mode is not exposed). The `rekord` entry type
- * sidesteps that by taking the artifact itself rather than a prehash, but it
- * depends on the v1 public instance, which is mid-migration. Neither is
- * ready to build on today.
+ * This sink was built on 2026-09-16 because a dedicated transparency log
+ * (Sigstore Rekor) looked blocked: `hashedrekord` needs an Ed25519ph
+ * signature (the prehashed variant, RFC 8032 §5.1.6), and Node's
+ * `node:crypto` only signs pure Ed25519. Re-checked for real on 2026-09-22,
+ * that blocker turned out not to hold any more — `@noble/curves` implements
+ * Ed25519ph, and Rekor's public write path is live — so `src/rekor-anchor.ts`
+ * now exists alongside this one. This module is kept as-is, not replaced:
+ * it does not need `@noble/curves`, it is a real, independent witness in its
+ * own right, and the README explains what each one proves that the other
+ * does not.
  *
  * What a transparency log actually buys — independent of the protocol — is
  * two things: an existence proof (this value existed by this time) and

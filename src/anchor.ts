@@ -27,10 +27,10 @@ export interface Anchor {
  * that cannot (a local file, `chflags uappnd`, a git note not yet pushed)
  * return undefined; there is nothing further to check than the file itself.
  *
- * `src/github-anchor.ts` is the first sink that returns a witness. It is the
- * seam a stronger sink — a real Sigstore Rekor entry, once Node's Ed25519
- * (not Ed25519ph) stops being a blocker — plugs into without the recorder or
- * verifier changing.
+ * `src/github-anchor.ts` was the first sink that returns a witness, and
+ * `src/rekor-anchor.ts` — a real Sigstore Rekor transparency-log entry —
+ * is the second. Both plug into this same interface without the recorder
+ * or verifier changing.
  */
 export interface AnchorSink<Witness = unknown> {
   write(anchor: Anchor): Witness;
