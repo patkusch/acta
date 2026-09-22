@@ -19,9 +19,18 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash, generateKeyPairSync } from 'node:crypto';
+import { createHash, createPublicKey, generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto';
 
-import { writeRekorAnchor, verifyRekorWitness, rootFromInclusionProof, type RekorExec, type RekorWitness } from '../src/rekor-anchor.ts';
+import {
+  writeRekorAnchor,
+  verifyRekorWitness,
+  rootFromInclusionProof,
+  parseCheckpoint,
+  verifyCheckpointSignature,
+  REKOR_SIGSTORE_DEV_CHECKPOINT_PUBLIC_KEY_PEM,
+  type RekorExec,
+  type RekorWitness,
+} from '../src/rekor-anchor.ts';
 import type { Anchor } from '../src/anchor.ts';
 
 const anchorA: Anchor = { session: 'rekor-test', seq: 3, hash: 'a'.repeat(64), at: '2026-09-22T09:00:00.000Z' };
@@ -72,6 +81,75 @@ test('rootFromInclusionProof rejects a proof of the wrong length rather than sil
   assert.throws(() => rootFromInclusionProof(1, 4163431, Buffer.alloc(32), [Buffer.alloc(32)]));
 });
 
+// --- checkpoint parsing and signature verification, against real fetched checkpoints ---
+//
+// Both checkpoints below were fetched for real from rekor.sigstore.dev on
+// 2026-09-22/23. The first is bundled with the same logIndex-1 entry used
+// above; the second is a fresh `GET /api/v1/log` read of the currently
+// active shard. Together they prove the ECDSA P-256 signature type for
+// real, against real data, before any of this was wired into
+// `verifyRekorWitness` — see the module doc for why Ed25519 was the wrong
+// assumption to carry over from the plan.
+
+const REAL_CHECKPOINT_LOGINDEX_1 =
+  'rekor.sigstore.dev - 3904496407287907110\n' +
+  '4163431\n' +
+  'TQBqpG78tgfdUdkAsSE3VMUMySUcNAXGwlYdnWovMjk=\n' +
+  '\n' +
+  '— rekor.sigstore.dev wNI9ajBFAiEAqu0HfRgZ3Us8aRWE1tElE4t5Rukwsd+m7ck/2pyd3qcCIHBgCnYEuZ6GNga6sofQ/sLvETuBh0MI/1pbujUVysCg\n';
+
+const REAL_CHECKPOINT_ACTIVE_SHARD =
+  'rekor.sigstore.dev - 1193050959916656506\n' +
+  '2787668724\n' +
+  'mIBb++gnp2hZUqcKzMQidxwa0eMuAU7uAq324IdmaJI=\n' +
+  '\n' +
+  '— rekor.sigstore.dev wNI9ajBEAiBqop3cXhaJSYc9vlBbXgZBg3lP77LstFExeb+mY1ig/wIgMgIg2n5XkwB9xQVTJObpyIldyzK6zN1kT4BSIBqvXFo=\n';
+
+test('parseCheckpoint reads a real rekor.sigstore.dev checkpoint (origin, size, root, signature)', () => {
+  const c = parseCheckpoint(REAL_CHECKPOINT_LOGINDEX_1);
+  assert.equal(c.origin, 'rekor.sigstore.dev - 3904496407287907110');
+  assert.equal(c.size, 4163431);
+  assert.equal(c.rootHash.toString('hex'), '4d006aa46efcb607dd51d900b1213754c50cc9251c3405c6c2561d9d6a2f3239');
+  assert.equal(c.signatures.length, 1);
+  assert.equal(c.signatures[0].name, 'rekor.sigstore.dev');
+  // The key hint on the signature line is the first 4 bytes of the logID
+  // every entry from this instance reports — checked here as an
+  // independent cross-check, not just asserted.
+  assert.equal(c.signatures[0].keyHint.toString('hex'), 'c0d23d6a');
+});
+
+test('verifyCheckpointSignature verifies a real checkpoint against the real rekor.sigstore.dev key, for two different real checkpoints (logIndex 1 and the current active shard)', () => {
+  for (const text of [REAL_CHECKPOINT_LOGINDEX_1, REAL_CHECKPOINT_ACTIVE_SHARD]) {
+    const check = verifyCheckpointSignature(text, REKOR_SIGSTORE_DEV_CHECKPOINT_PUBLIC_KEY_PEM);
+    assert.deepEqual(check.findings, []);
+    assert.equal(check.ok, true);
+  }
+});
+
+test('verifyCheckpointSignature rejects a checkpoint whose signature was tampered with', () => {
+  const tampered = REAL_CHECKPOINT_LOGINDEX_1.replace('wNI9aj', 'wNI9ak');
+  const check = verifyCheckpointSignature(tampered, REKOR_SIGSTORE_DEV_CHECKPOINT_PUBLIC_KEY_PEM);
+  assert.equal(check.ok, false);
+  assert.ok(check.findings.some((f) => f.code === 'CHECKPOINT_SIGNATURE_INVALID' || f.code === 'CHECKPOINT_UNPARSEABLE'));
+});
+
+test('verifyCheckpointSignature rejects a checkpoint whose root hash was tampered with (signature no longer covers the modified note)', () => {
+  const tampered = REAL_CHECKPOINT_LOGINDEX_1.replace('TQBqpG78tgfdUdkAsSE3VMUMySUcNAXGwlYdnWovMjk=', Buffer.alloc(32, 0xaa).toString('base64'));
+  const check = verifyCheckpointSignature(tampered, REKOR_SIGSTORE_DEV_CHECKPOINT_PUBLIC_KEY_PEM);
+  assert.equal(check.ok, false);
+  assert.ok(check.findings.some((f) => f.code === 'CHECKPOINT_SIGNATURE_INVALID'));
+});
+
+test('verifyCheckpointSignature rejects a well-formed checkpoint signed by a key that is not the one asked for', () => {
+  const check = verifyCheckpointSignature(REAL_CHECKPOINT_LOGINDEX_1, generateKeyPairSync('ec', { namedCurve: 'P-256' }).publicKey.export({ type: 'spki', format: 'pem' }) as string);
+  assert.equal(check.ok, false);
+  assert.ok(check.findings.some((f) => f.code === 'CHECKPOINT_KEY_MISMATCH'));
+});
+
+test('parseCheckpoint throws on a checkpoint with no blank line before the signature block', () => {
+  assert.throws(() => parseCheckpoint('not a checkpoint at all'));
+});
+
 // --- writeRekorAnchor / verifyRekorWitness, against a fake Rekor -----------
 
 /** Deterministic 32-byte Ed25519 seed for a test key — not used for anything real. */
@@ -80,14 +158,33 @@ function testSeed(): Uint8Array {
   return Buffer.from((privateKey.export({ format: 'jwk' }) as { d: string }).d, 'base64url');
 }
 
+/** Signs a fake checkpoint the same way rekor.sigstore.dev's real one is shaped (see the module doc): ECDSA P-256 over SHA-256 of the note text, 4-byte key-hint-prefixed signature line. */
+function signFakeCheckpoint(priv: KeyObject, origin: string, size: number, rootHash: Buffer): string {
+  const note = `${origin}\n${size}\n${rootHash.toString('base64')}\n`;
+  const sig = cryptoSign('sha256', Buffer.from(note, 'utf8'), priv);
+  const pubDer = createPublicKey(priv).export({ type: 'spki', format: 'der' }) as Buffer;
+  const keyHint = createHash('sha256').update(pubDer).digest().subarray(0, 4);
+  const sigLine = Buffer.concat([keyHint, sig]).toString('base64');
+  return `${note}\n— fake-log ${sigLine}\n`;
+}
+
+function fakeCheckpointKeyPair() {
+  const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  return { privateKey, checkpointPublicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }) as string };
+}
+
 /**
  * A tiny in-memory stand-in for the slice of Rekor's v1 API this module
  * uses: POST creates a single-leaf-tree entry (so the inclusion proof is
  * trivial — a real one is checked separately, above, against real data),
- * GET by UUID fetches it back.
+ * GET by UUID fetches it back. The checkpoint bundled with each entry is a
+ * real, verifiable signature (over the trivial 1-leaf tree), signed with a
+ * fresh per-fake ECDSA key — not the real rekor.sigstore.dev key, so callers
+ * must pass back `checkpointPublicKeyPem`.
  */
 function fakeRekor() {
   const entries = new Map<string, unknown>();
+  const { privateKey, checkpointPublicKeyPem } = fakeCheckpointKeyPair();
   let counter = 0;
 
   const exec: RekorExec = (method, url, body) => {
@@ -97,14 +194,15 @@ function fakeRekor() {
       const submitted = JSON.parse(body!) as { spec: unknown };
       const entryBodyB64 = Buffer.from(JSON.stringify({ kind: 'hashedrekord', apiVersion: '0.0.1', spec: submitted.spec })).toString('base64');
       const entryBytes = Buffer.from(entryBodyB64, 'base64');
-      const leafHash = createHash('sha256').update(Buffer.concat([Buffer.from([0x00]), entryBytes])).digest('hex');
+      const leafHash = createHash('sha256').update(Buffer.concat([Buffer.from([0x00]), entryBytes])).digest();
+      const checkpoint = signFakeCheckpoint(privateKey, `fake-log - ${counter}`, 1, leafHash);
       const entry = {
         body: entryBodyB64,
         integratedTime: 1700000000 + counter,
         logID: 'fake-log-id',
         logIndex: 1000 + counter,
         verification: {
-          inclusionProof: { logIndex: 0, treeSize: 1, hashes: [], rootHash: leafHash, checkpoint: 'fake checkpoint\n' },
+          inclusionProof: { logIndex: 0, treeSize: 1, hashes: [], rootHash: leafHash.toString('hex'), checkpoint },
           signedEntryTimestamp: 'fake-set',
         },
       };
@@ -121,11 +219,11 @@ function fakeRekor() {
     throw new Error(`unexpected request: ${method} ${url}`);
   };
 
-  return { exec, entries };
+  return { exec, entries, checkpointPublicKeyPem };
 }
 
 test('writeRekorAnchor produces a witness that verifyRekorWitness confirms', () => {
-  const { exec } = fakeRekor();
+  const { exec, checkpointPublicKeyPem } = fakeRekor();
   const seed = testSeed();
   const w = writeRekorAnchor(anchorA, { secretKey: seed, exec });
 
@@ -134,13 +232,13 @@ test('writeRekorAnchor produces a witness that verifyRekorWitness confirms', () 
   assert.ok(w.uuid);
   assert.equal(w.publicKeyHex.length, 64, 'raw 32-byte ed25519 public key, hex');
 
-  const check = verifyRekorWitness(w, { exec });
+  const check = verifyRekorWitness(w, { exec, checkpointPublicKeyPem });
   assert.deepEqual(check.findings, []);
   assert.equal(check.ok, true);
 });
 
 test('verifyRekorWitness actually checks the Ed25519ph signature, not just structure: corrupting the signature bytes on the log entry is caught', () => {
-  const { exec, entries } = fakeRekor();
+  const { exec, entries, checkpointPublicKeyPem } = fakeRekor();
   const w = writeRekorAnchor(anchorA, { secretKey: testSeed(), exec });
   const entry = entries.get(w.uuid) as { body: string };
   const decoded = JSON.parse(Buffer.from(entry.body, 'base64').toString('utf8')) as { spec: { signature: { content: string } } };
@@ -149,67 +247,86 @@ test('verifyRekorWitness actually checks the Ed25519ph signature, not just struc
   decoded.spec.signature.content = sig.toString('base64');
   entry.body = Buffer.from(JSON.stringify(decoded)).toString('base64');
 
-  const check = verifyRekorWitness(w, { exec });
+  const check = verifyRekorWitness(w, { exec, checkpointPublicKeyPem });
   assert.equal(check.ok, false);
   // The body changed, so its own leaf hash no longer matches the inclusion
   // proof the fake computed at write time — exactly the kind of tamper a
   // real proof recomputation is supposed to catch, alongside the signature
   // check itself.
-  assert.ok(check.findings.some((f) => f.code === 'REKOR_SIGNATURE_INVALID' || f.code === 'REKOR_INCLUSION_PROOF_INVALID'));
+  assert.ok(check.findings.some((f) => f.code === 'REKOR_SIGNATURE_INVALID' || f.code === 'CHECKPOINT_ROOT_MISMATCH' || f.code === 'REKOR_INCLUSION_PROOF_INVALID'));
 });
 
 test('verifyRekorWitness rejects a witness whose public key does not match what the log entry actually holds', () => {
-  const { exec } = fakeRekor();
+  const { exec, checkpointPublicKeyPem } = fakeRekor();
   const w = writeRekorAnchor(anchorA, { secretKey: testSeed(), exec });
   const tampered: RekorWitness = { ...w, publicKeyHex: '00'.repeat(32) };
-  const check = verifyRekorWitness(tampered, { exec });
+  const check = verifyRekorWitness(tampered, { exec, checkpointPublicKeyPem });
   assert.equal(check.ok, false);
   assert.ok(check.findings.some((f) => f.code === 'REKOR_PUBLIC_KEY_MISMATCH'));
 });
 
 test('verifyRekorWitness rejects a witness claiming an anchor the log entry does not actually hash to', () => {
-  const { exec } = fakeRekor();
+  const { exec, checkpointPublicKeyPem } = fakeRekor();
   const w = writeRekorAnchor(anchorA, { secretKey: testSeed(), exec });
   const tampered: RekorWitness = { ...w, anchor: anchorB }; // same entry, claims a different anchor
-  const check = verifyRekorWitness(tampered, { exec });
+  const check = verifyRekorWitness(tampered, { exec, checkpointPublicKeyPem });
   assert.equal(check.ok, false);
   assert.ok(check.findings.some((f) => f.code === 'REKOR_HASH_MISMATCH'));
   assert.ok(check.findings.some((f) => f.code === 'REKOR_SIGNATURE_INVALID'), 'the signature was over anchorA, not anchorB, so re-verifying against anchorB must fail too');
 });
 
 test('verifyRekorWitness rejects a witness whose logID does not match the log entry', () => {
-  const { exec } = fakeRekor();
+  const { exec, checkpointPublicKeyPem } = fakeRekor();
   const w = writeRekorAnchor(anchorA, { secretKey: testSeed(), exec });
   const tampered: RekorWitness = { ...w, logID: 'not-the-real-log-id' };
-  const check = verifyRekorWitness(tampered, { exec });
+  const check = verifyRekorWitness(tampered, { exec, checkpointPublicKeyPem });
   assert.equal(check.ok, false);
   assert.ok(check.findings.some((f) => f.code === 'REKOR_LOG_ID_MISMATCH'));
 });
 
 test('verifyRekorWitness rejects a witness whose integratedTime does not match the log entry', () => {
-  const { exec } = fakeRekor();
+  const { exec, checkpointPublicKeyPem } = fakeRekor();
   const w = writeRekorAnchor(anchorA, { secretKey: testSeed(), exec });
   const tampered: RekorWitness = { ...w, integratedTime: 1 };
-  const check = verifyRekorWitness(tampered, { exec });
+  const check = verifyRekorWitness(tampered, { exec, checkpointPublicKeyPem });
   assert.equal(check.ok, false);
   assert.ok(check.findings.some((f) => f.code === 'REKOR_INTEGRATED_TIME_MISMATCH'));
 });
 
-test('verifyRekorWitness rejects a witness whose inclusion proof does not recompute to the claimed root', () => {
-  const { exec, entries } = fakeRekor();
+test('verifyRekorWitness rejects a witness whose inclusion proof does not recompute to the checkpoint-verified root', () => {
+  const { exec, entries, checkpointPublicKeyPem } = fakeRekor();
   const w = writeRekorAnchor(anchorA, { secretKey: testSeed(), exec });
   const entry = entries.get(w.uuid) as { verification: { inclusionProof: { rootHash: string } } };
-  entry.verification.inclusionProof.rootHash = 'f'.repeat(64); // corrupt the root after the fact
-  const check = verifyRekorWitness(w, { exec });
+  entry.verification.inclusionProof.rootHash = 'f'.repeat(64); // corrupt the root after the fact — no longer what the checkpoint attests to
+  const check = verifyRekorWitness(w, { exec, checkpointPublicKeyPem });
   assert.equal(check.ok, false);
-  assert.ok(check.findings.some((f) => f.code === 'REKOR_INCLUSION_PROOF_INVALID'));
+  assert.ok(check.findings.some((f) => f.code === 'CHECKPOINT_ROOT_MISMATCH'), 'the corrupted rootHash no longer matches what the (untouched) checkpoint signs');
+});
+
+test('verifyRekorWitness rejects an entry whose checkpoint is missing', () => {
+  const { exec, entries, checkpointPublicKeyPem } = fakeRekor();
+  const w = writeRekorAnchor(anchorA, { secretKey: testSeed(), exec });
+  const entry = entries.get(w.uuid) as { verification: { inclusionProof: { checkpoint?: string } } };
+  delete entry.verification.inclusionProof.checkpoint;
+  const check = verifyRekorWitness(w, { exec, checkpointPublicKeyPem });
+  assert.equal(check.ok, false);
+  assert.ok(check.findings.some((f) => f.code === 'CHECKPOINT_MISSING'));
+});
+
+test('verifyRekorWitness rejects an entry whose checkpoint is present but not signed by the key the caller trusts', () => {
+  const { checkpointPublicKeyPem: wrongKey } = fakeRekor();
+  const { exec: exec2 } = fakeRekor(); // a second fake, unrelated signing key
+  const w = writeRekorAnchor(anchorA, { secretKey: testSeed(), exec: exec2 });
+  const check = verifyRekorWitness(w, { exec: exec2, checkpointPublicKeyPem: wrongKey });
+  assert.equal(check.ok, false);
+  assert.ok(check.findings.some((f) => f.code === 'CHECKPOINT_KEY_MISMATCH'));
 });
 
 test('verifyRekorWitness reports a missing entry as tamper, not as unreachable', () => {
-  const { exec } = fakeRekor();
+  const { exec, checkpointPublicKeyPem } = fakeRekor();
   const w = writeRekorAnchor(anchorA, { secretKey: testSeed(), exec });
   const tampered: RekorWitness = { ...w, uuid: 'uuid-does-not-exist' };
-  const check = verifyRekorWitness(tampered, { exec });
+  const check = verifyRekorWitness(tampered, { exec, checkpointPublicKeyPem });
   assert.equal(check.ok, false);
   assert.equal(check.unreachable, false);
   assert.ok(check.findings.some((f) => f.code === 'REKOR_ENTRY_NOT_FOUND'));

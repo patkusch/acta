@@ -677,15 +677,53 @@ entry exists for this submission at
 by the time it was integrated, checkably by anyone, against a real
 transparency log rather than one party's commit history.
 
-**What this does not prove yet**, and the [Not built](#not-built) section
-says so precisely: `verifyRekorWitness` does not check the checkpoint's own
-signature (the signed statement of the root hash the inclusion proof is
-checked against), and it checks one submission at a time, not consistency
-across submissions the way the witness ledger does for GitHub. A dishonest
-log could still forge the root hash it answers with — though not without
-also producing a valid Ed25519ph signature from a key that signed something
-else, which is the part this module's checks actually anchor their trust
-in.
+**Checkpoint-signature verification — closed for real, 2026-09-23.** Until
+now, the root hash the inclusion proof was checked against was simply
+whatever the response asserted: a dishonest or compromised intermediary
+between the caller and Rekor could have lied about it. Rekor bundles a
+*checkpoint* with every inclusion proof — a signed statement, in the
+`transparency-dev/formats`-style "signed note" format, of exactly the tree
+size and root hash the proof claims — and `verifyRekorWitness` now parses
+and verifies that signature before trusting the root at all, via a new
+`verifyCheckpointSignature`.
+
+The plan for this work assumed the checkpoint signature would be Ed25519,
+by analogy with the hashedrekord entry signature above. Checked for real
+instead of assumed, and it does not hold: `GET /api/v1/log/publicKey` on
+`rekor.sigstore.dev` returns an ECDSA P-256 key, not Ed25519 — its SHA-256
+hash's first 4 bytes equal the `logID` every entry from this instance
+reports, and a real checkpoint verifies against it with plain
+`crypto.verify('sha256', note, key, sig)`, no `@noble/curves` involved (that
+library is only for the Ed25519ph *entry* signatures above, a separate
+scheme). Sigstore's own `trusted_root.json` shows this is instance-specific
+— a Rekor v2 instance (`log2025-1.rekor.sigstore.dev`) does use Ed25519 for
+its checkpoints — so the type had to be confirmed per-instance, not assumed
+from the format's name.
+
+**The real proof, done for real, on 2026-09-23**, against the same live
+entry the 2026-09-22 submission produced
+(`uuid 108e9186e8c5677a1e69c0dc0dc221fc96bc03a2087d5539615e8bb0b1a5b60f481ac6665ffeb67f`,
+`logIndex 2909493026`): fetched that entry fresh, parsed its bundled
+checkpoint, verified its ECDSA signature against the real
+`rekor.sigstore.dev` key, and confirmed the entry's inclusion proof
+recomputes to that *verified* root — not merely the root the JSON response
+asserted:
+
+```
+checkpoint origin:      rekor.sigstore.dev - 1193050959916656506
+checkpoint size:        2787689366
+checkpoint verify ok:   true, findings: []
+inclusion proof recomputed root matches the verified checkpoint root: true
+```
+
+**What this still does not prove**, narrowed from before: one submission is
+checked at a time, not consistency across submissions the way the witness
+ledger does for GitHub. A dishonest log can no longer simply assert a root —
+forging one now needs a valid ECDSA signature from the key every checkpoint
+this instance has ever published was verified against — but nothing yet
+confirms the tree Rekor shows you *today* is a real, append-only extension
+of the tree it showed you *yesterday*. See [the next
+section](#cross-submission-log-consistency).
 
 ```ts
 import { writeRekorAnchor, verifyRekorWitness } from './src/rekor-anchor.ts';
@@ -698,7 +736,7 @@ const secretKey = Buffer.from(privateKey.export({ format: 'jwk' }).d, 'base64url
 const witness = writeRekorAnchor(anchor, { secretKey });
 // { provider: 'rekor', rekorUrl, uuid, logIndex, logID, integratedTime, publicKeyHex, anchor }
 
-verifyRekorWitness(witness).ok  // re-fetches by uuid; recomputes the Merkle inclusion proof from scratch
+verifyRekorWitness(witness).ok  // re-fetches by uuid; verifies the bundled checkpoint's ECDSA signature; recomputes the Merkle inclusion proof against that verified root
 ```
 
 | finding | severity | meaning |
@@ -709,7 +747,10 @@ verifyRekorWitness(witness).ok  // re-fetches by uuid; recomputes the Merkle inc
 | `REKOR_PUBLIC_KEY_MISMATCH` | tamper | the entry's public key is not the one the witness names |
 | `REKOR_LOG_ID_MISMATCH`, `REKOR_INTEGRATED_TIME_MISMATCH` | tamper | the entry's logID or integration time disagree with what was recorded |
 | `REKOR_BODY_UNPARSEABLE` | tamper | the entry's body is not the JSON a hashedrekord entry should be |
-| `REKOR_INCLUSION_PROOF_MISSING`, `REKOR_INCLUSION_PROOF_INVALID` | tamper | no inclusion proof was returned, or it does not recompute to the claimed root |
+| `CHECKPOINT_MISSING`, `CHECKPOINT_UNPARSEABLE` | tamper | the inclusion proof carries no checkpoint, or it is not the signed-note format Rekor uses |
+| `CHECKPOINT_KEY_MISMATCH`, `CHECKPOINT_SIGNATURE_INVALID` | tamper | no signature on the checkpoint matches the trusted key, or the one that does does not verify |
+| `CHECKPOINT_ROOT_MISMATCH` | tamper | the checkpoint attests to a different size or root than the inclusion proof claims |
+| `REKOR_INCLUSION_PROOF_MISSING`, `REKOR_INCLUSION_PROOF_INVALID` | tamper | no inclusion proof was returned, or it does not recompute to the checkpoint-verified root |
 | `REKOR_UNREACHABLE` | warn | Rekor did not answer (network, rate limit) — never a pass, never tamper on its own |
 
 ## Findings reference
@@ -772,23 +813,21 @@ on its own, whatever the ledger's own verdict says.
 
 ## Not built
 
-- **Checkpoint-signature and log-consistency verification for the Rekor
-  witness.** [`RekorAnchorSink` submits to a real transparency log and
-  recomputes a real Merkle inclusion proof](#a-public-transparency-log-witness-rekor)
-  — the recomputation is genuine, not decorative, and checked against real
-  fetched log data. What it does not yet do: verify the checkpoint's own
-  signature (so a dishonest log could still forge the root hash the
-  inclusion proof is checked against, though not without also forging a
-  valid signature from a key that signed something else), and it checks one
-  submission at a time rather than log consistency over repeated
-  submissions the way [the witness ledger](#the-witness-ledger) does for
-  the GitHub sink. Closing this needs porting `pkg/verify/verify.go`'s
-  `VerifyCheckpointSignature` (a "signed note" format, not plain
-  ECDSA-over-SHA256) and something like a `witness-ledger.ts` for Rekor
-  entries specifically. Dated 2026-09-22 — see the section linked above for
-  what was actually checked before writing this, and why the Ed25519ph
-  blocker this used to be filed under turned out not to be the real one any
-  more.
+- **Log-consistency verification across repeated Rekor submissions.**
+  [Checkpoint-signature verification closed 2026-09-23](#a-public-transparency-log-witness-rekor):
+  `verifyRekorWitness` no longer trusts the root hash an inclusion proof
+  merely asserts, it verifies the ECDSA signature Rekor actually published
+  over that root first. What is left: each `verifyRekorWitness` call still
+  checks one submission at a time, the way the Rekor sink did before the
+  [witness ledger](#the-witness-ledger) gave the GitHub sink cross-submission
+  checking. A dishonest log that publishes two genuinely, independently
+  signed checkpoints — one for each of two submissions — but where the later
+  one is not actually a real append-only extension of the earlier one, would
+  not yet be caught. Closing this needs a real RFC 6962 consistency proof
+  between the two tree states (`transparency-dev/merkle`'s `proof.go` has
+  the algorithm alongside the inclusion-proof one already ported) and
+  something to fetch or accept two checkpoints to check it against. Dated
+  2026-09-22, narrowed 2026-09-23.
 
 ## License
 
