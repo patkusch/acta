@@ -17,7 +17,7 @@
 <br/>
 
 [![License](https://img.shields.io/badge/License-MIT-1A1A1A?style=for-the-badge)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-78-2ea043?style=for-the-badge)](./test)
+[![Tests](https://img.shields.io/badge/tests-115-2ea043?style=for-the-badge)](./test)
 [![Attacks](https://img.shields.io/badge/attacks_tested-12-2ea043?style=for-the-badge)](#the-attack-table)
 [![Dependencies](https://img.shields.io/badge/runtime_dependencies-0-1A1A1A?style=for-the-badge)](./package.json)
 [![test](https://github.com/patkusch/acta/actions/workflows/test.yml/badge.svg)](https://github.com/patkusch/acta/actions/workflows/test.yml)
@@ -82,7 +82,7 @@ attackers it can and cannot catch.
 
 ```bash
 npm install
-npm test          # 78 tests: the chain, the recorder, the proxy, resume, key rotation, definition binding, the GitHub witness sink and its ledger, and every attack in the catalogue
+npm test          # 115 tests: the chain, the recorder, the proxy, resume, key rotation, definition binding, the GitHub and Rekor witnesses and their ledger, and every attack in the catalogue
 npm run attack    # the demo: twelve attacks, three verifier configurations, one cell that stays red
 
 # record a real MCP server
