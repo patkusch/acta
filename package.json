@@ -1,6 +1,10 @@
 {
   "name": "acta",
   "version": "0.1.0",
+  "author": "patkusch",
+  "repository": { "type": "git", "url": "git+https://github.com/patkusch/acta.git" },
+  "homepage": "https://github.com/patkusch/acta#readme",
+  "bugs": { "url": "https://github.com/patkusch/acta/issues" },
   "description": "A tamper-evident record of what an agent actually did — hash-chained, signed, anchored, and honest about what that does not prove.",
   "license": "MIT",
   "type": "module",
