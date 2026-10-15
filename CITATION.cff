@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "acta"
+abstract: "A tamper-evident record of what an agent actually did — hash-chained, signed, anchored, and honest about what that does not prove."
+type: software
+authors:
+  - family-names: "Kusch"
+    given-names: "Patricia"
+repository-code: "https://github.com/patkusch/acta"
+license: MIT
