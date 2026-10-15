@@ -5,6 +5,8 @@
  * acta witness backup [ledger] --to <path | owner/name[:branch]>   copy the witness ledger somewhere else you control
  * acta witness add <witness.json> [--ledger path]                  file an existing witness in the ledger
  * acta verify --witnesses <witnesses.jsonl>                        check every recorded witness against its provider (GitHub and/or Rekor)
+ * acta step   [dir] --agent a --stage s --action "..." [--ref r] [--failed] | --close
+ * acta serve  [--port n]                   a small public checker for ledgers
  * acta show   [dir]                          print the timeline
  * acta mcp    [--dir d] [--resume [--rotate-on-resume]] [--anchor-every n] [--anchor-to file | --anchor-append-to file] -- <command...>
  */
@@ -30,6 +32,8 @@ import { BLOB_DIR, PUB_FILE, loadOrCreateKeys, loadPublicKey, readLedger, finger
 import { verifyLedger, type Verdict } from './verify.ts';
 import { startProxy } from './mcp/proxy.ts';
 import { describe } from './show.ts';
+import { recordStep, closeSession, type Stage } from './step.ts';
+import { makeServer } from './serve.ts';
 
 const BOLD = '\x1b[1m';
 const DIM = '\x1b[2m';
@@ -67,6 +71,9 @@ function usage(code: number): never {
       '  acta anchor [dir] [--to anchors.jsonl] [--append-to anchors.jsonl] [--git [--repo path]] [--github owner/name[:branch] [--github-path file]] [--rekor [--rekor-url url]] [--witness-out file] [--witness-ledger witnesses.jsonl]',
       '  acta witness backup [witnesses.jsonl | dir] --to <path | owner/name[:branch]> [--backup-path file]',
       '  acta witness add witness.json [--ledger witnesses.jsonl]',
+      '  acta step   [dir] --agent <name> --stage <plan|create|verify|package|secure|release|configure|monitor|govern> --action <text> [--ref <link>] [--failed]',
+      '  acta step   [dir] --close',
+      '  acta serve  [--port 8080]',
       '  acta show   [dir]',
       '  acta mcp    [--dir .acta] [--resume [--rotate-on-resume]] [--anchor-every N] [--anchor-to file | --anchor-append-to file] -- <command> [args...]',
     ].join('\n'),
@@ -294,6 +301,31 @@ switch (command) {
       console.error(`${RED}${(e as Error).message.trim()}${OFF}`);
       process.exit(2);
     }
+    break;
+  }
+
+  case 'step': {
+    const dir = ledgerDir();
+    if (has('--close')) {
+      closeSession(dir);
+      break;
+    }
+    const agent = flag('--agent');
+    const stage = flag('--stage');
+    const action = flag('--action');
+    if (!agent || !stage || !action) usage(2);
+    try {
+      recordStep(dir, { agent, stage: stage as Stage, action, ref: flag('--ref'), ok: !has('--failed') });
+    } catch (e) {
+      console.error((e as Error).message);
+      process.exit(2);
+    }
+    break;
+  }
+
+  case 'serve': {
+    const port = Number(flag('--port') ?? process.env.PORT ?? 8080);
+    makeServer().listen(port, '0.0.0.0', () => console.log(`acta checker on :${port}`));
     break;
   }
 
