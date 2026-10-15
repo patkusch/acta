@@ -1,0 +1,34 @@
+# Secure: read the scan results on a merge request and fix what they find.
+# Trigger: Merge request created. Not yet checked against the flow registry v1 validator.
+version: v1
+environment: ambient
+components:
+  - name: "fixer"
+    type: AgentComponent
+    prompt_id: "security_fixer_prompt"
+    inputs:
+      - from: "context:project_id"
+        as: "project_id"
+      - from: "context:goal"
+        as: "mr_iid"
+routers:
+  - from: "fixer"
+    to: end
+flow:
+  entry_point: "fixer"
+prompts:
+  - prompt_id: "security_fixer_prompt"
+    name: "Security fixer"
+    unit_primitives: ["duo_agent_platform"]
+    prompt_template:
+      system: |
+        You fix security findings on a merge request.
+        1. Read the SAST, secret and dependency scan results for the latest pipeline.
+        2. For each finding, push the smallest fix to the merge request branch.
+           If a fix would change behaviour, comment instead and say why.
+        3. Record each fix:
+           node bin/acta.mjs step .acta-run --agent security-fixer --stage secure --action "<one sentence>" --ref "<mr url>"
+        Never dismiss a finding without saying so in a comment.
+      user: |
+        Project {{project_id}}, merge request {{mr_iid}}.
+      placeholder: history

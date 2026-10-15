@@ -1,0 +1,36 @@
+# Plan + Create: read a new issue, split it into tasks, open a merge request.
+# Paste into AI > Flows > New flow. Trigger: Work item created. Not yet checked
+# against the flow registry v1 validator.
+version: v1
+environment: ambient
+components:
+  - name: "planner"
+    type: AgentComponent
+    prompt_id: "issue_to_mr_prompt"
+    inputs:
+      - from: "context:project_id"
+        as: "project_id"
+      - from: "context:goal"
+        as: "issue"
+routers:
+  - from: "planner"
+    to: end
+flow:
+  entry_point: "planner"
+prompts:
+  - prompt_id: "issue_to_mr_prompt"
+    name: "Issue to merge request"
+    unit_primitives: ["duo_agent_platform"]
+    prompt_template:
+      system: |
+        You turn an issue into a merge request in this project.
+        1. Read the issue and write a short task list as a comment on it.
+        2. Make the smallest change that does the job, with a test.
+        3. Open a merge request that links the issue.
+        4. Record what you did by running:
+           node bin/acta.mjs step .acta-run --agent issue-to-mr --stage plan --action "<one sentence>" --ref "<issue url>"
+           and again with --stage create for the merge request.
+        Never merge. Never edit .acta-run by hand.
+      user: |
+        Project {{project_id}}. Issue: {{issue}}
+      placeholder: history

@@ -1,0 +1,33 @@
+# Release + Monitor: when the default branch pipeline finishes, check the live
+# service and, if it is unhealthy, roll back and report on the original issue.
+# Trigger: Pipeline. Not yet checked against the flow registry v1 validator.
+version: v1
+environment: ambient
+components:
+  - name: "watcher"
+    type: AgentComponent
+    prompt_id: "release_watcher_prompt"
+    inputs:
+      - from: "context:project_id"
+        as: "project_id"
+      - from: "context:goal"
+        as: "pipeline"
+routers:
+  - from: "watcher"
+    to: end
+flow:
+  entry_point: "watcher"
+prompts:
+  - prompt_id: "release_watcher_prompt"
+    name: "Release watcher"
+    unit_primitives: ["duo_agent_platform"]
+    prompt_template:
+      system: |
+        You look after a release after the pipeline finishes.
+        1. If the production smoke job failed, revert the merge request that shipped it and open a new issue explaining what broke.
+        2. If it passed, comment a short summary on the original issue: what shipped, the pipeline link, and the link to the Acta checker.
+        3. Download the .acta-run artifact, run `node bin/acta.mjs verify .acta-run --json`, and put the verdict (tampered, consistent or verified) in the comment.
+        4. Record what you did with --stage monitor, then --stage govern.
+      user: |
+        Project {{project_id}}. Pipeline event: {{pipeline}}
+      placeholder: history
