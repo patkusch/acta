@@ -26,3 +26,11 @@ Built for the GitLab Transcend hackathon (Path B: an existing MIT project, with 
 
 ## Not yet verified
 The flow files have not been run on GitLab and may need field changes to pass the v1 validator. The pipeline has not been run on GitLab. Nothing has been deployed.
+
+## Try it without any account
+
+```bash
+sh scripts/demo.sh
+```
+
+Plays nine agent steps into a ledger, checks it, edits one line, and checks again.

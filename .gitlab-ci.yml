@@ -5,7 +5,7 @@ include:
   - template: Security/Secret-Detection.gitlab-ci.yml
   - template: Security/Dependency-Scanning.gitlab-ci.yml
 
-stages: [test, package, staging, production, monitor, govern]
+stages: [test, package, record_package, staging, record_staging, production, record_production, monitor, record_monitor, govern]
 
 default:
   image: node:22
@@ -31,6 +31,14 @@ test:
     - scripts/ci-step.sh ci-pipeline verify "typecheck, 118+ tests and the attack table passed"
   after_script:
     - '[ "$CI_JOB_STATUS" = "success" ] || scripts/ci-step.sh ci-pipeline verify "tests failed" --failed'
+
+
+# The package, deploy and smoke jobs run in images without node, so a small
+# node job after each one writes its step into the ledger (restored from the
+# previous record job's artifact).
+.record_job:
+  <<: *record
+  rules: [{ if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $GCP_PROJECT' }]
 
 package:
   stage: package
@@ -78,11 +86,40 @@ smoke_production:
   script:
     - sh deploy/smoke.sh "$PRODUCTION_URL"
 
+record_package:
+  extends: .record_job
+  stage: record_package
+  needs: [package, { job: test, artifacts: true }]
+  script: [scripts/ci-step.sh ci-pipeline package "built and pushed the container image $CI_COMMIT_SHORT_SHA"]
+
+record_staging:
+  extends: .record_job
+  stage: record_staging
+  needs: [smoke_staging, { job: record_package, artifacts: true }]
+  script: [scripts/ci-step.sh ci-pipeline release "deployed to staging and the smoke check passed"]
+
+record_production:
+  extends: .record_job
+  stage: record_production
+  needs: [deploy_production, { job: record_staging, artifacts: true }]
+  script: [scripts/ci-step.sh ci-pipeline configure "production service settings applied from deploy/cloud-run.sh"]
+
+record_monitor:
+  extends: .record_job
+  stage: record_monitor
+  needs: [smoke_production, { job: record_production, artifacts: true }]
+  script: [scripts/ci-step.sh ci-pipeline monitor "production smoke check passed"]
+
 # Govern: close the ledger and fail the pipeline if it does not check out.
 govern:
   stage: govern
   <<: *record
-  needs: [test]
+  needs:
+    - job: test
+      artifacts: true
+    - job: record_monitor
+      artifacts: true
+      optional: true
   rules: [{ if: '$CI_COMMIT_BRANCH' }]
   script:
     - scripts/ci-step.sh ci-pipeline govern "pipeline finished; closing the record"
