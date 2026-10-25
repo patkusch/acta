@@ -82,7 +82,7 @@ attackers it can and cannot catch.
 
 ```bash
 npm install
-npm test          # 118 tests: the chain, the recorder, the proxy, resume, key rotation, definition binding, the GitHub and Rekor witnesses and their ledger, and every attack in the catalogue
+npm test          # 127 tests: the chain, the recorder, the proxy, resume, key rotation, definition binding, the GitHub and Rekor witnesses and their ledger, and every attack in the catalogue
 npm run attack    # the demo: twelve attacks, three verifier configurations, one cell that stays red
 
 # record a real MCP server
