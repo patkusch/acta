@@ -66,6 +66,7 @@ function usage(code: number): never {
     [
       'usage:',
       '  acta init   [dir]',
+      '  acta version',
       '  acta verify [dir] [--key recorder.pub] [--anchors anchors.jsonl] [--git [--repo path]] [--witness witness.json] [--strict] [--json]',
       '  acta verify --witnesses witnesses.jsonl [--json]',
       '  acta anchor [dir] [--to anchors.jsonl] [--append-to anchors.jsonl] [--git [--repo path]] [--github owner/name[:branch] [--github-path file]] [--rekor [--rekor-url url]] [--witness-out file] [--witness-ledger witnesses.jsonl]',
@@ -100,6 +101,12 @@ function loadOrCreateRekorKey(dir: string): Buffer {
 const colour = (status: Verdict['status']) => (status === 'verified' ? GREEN : status === 'consistent' ? YELLOW : RED);
 
 switch (command) {
+  case '--version':
+  case 'version': {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
+    console.log(`acta ${pkg.version}`);
+    break;
+  }
   case 'init': {
     const dir = ledgerDir();
     const keys = loadOrCreateKeys(dir);
