@@ -314,7 +314,12 @@ switch (command) {
   case 'step': {
     const dir = ledgerDir();
     if (has('--close')) {
-      closeSession(dir);
+      try {
+        closeSession(dir);
+      } catch (e) {
+        console.error((e as Error).message);
+        process.exit(2);
+      }
       break;
     }
     const agent = flag('--agent');
