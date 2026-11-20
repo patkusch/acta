@@ -933,3 +933,7 @@ blanket disclaimer here.
 ## License
 
 MIT.
+
+---
+
+[Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)
