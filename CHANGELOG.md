@@ -10,6 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A one-line-per-entry view of a ledger (`acta show`).
 - `acta step` (one agent action per call into a resumable ledger) and `acta serve` (a small public checker for ledgers).
 
+### Fixed
+- Closing a ledger twice now says so plainly and exits with 2, instead of printing a stack trace.
+
 ### Changed
 - Dependencies updated within their allowed ranges; TypeScript is now 5.9.
 
