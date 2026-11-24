@@ -17,7 +17,7 @@
 <br/>
 
 [![License](https://img.shields.io/badge/License-MIT-1A1A1A?style=for-the-badge)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-115-2ea043?style=for-the-badge)](./test)
+[![Tests](https://img.shields.io/badge/tests-150-2ea043?style=for-the-badge)](./test)
 [![Attacks](https://img.shields.io/badge/attacks_tested-12-2ea043?style=for-the-badge)](#the-attack-table)
 [![Dependencies](https://img.shields.io/badge/runtime_dependencies-0-1A1A1A?style=for-the-badge)](./package.json)
 [![test](https://github.com/patkusch/acta/actions/workflows/test.yml/badge.svg)](https://github.com/patkusch/acta/actions/workflows/test.yml)
